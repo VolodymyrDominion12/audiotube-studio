@@ -1,0 +1,46 @@
+# Скопіюйте у config.yaml (або виконайте `audiotube init`) і налаштуйте під себе.
+# Шляхи відносні до кореня проєкту.
+
+paths:
+  inbox: inbox            # сюди кладете нові аудіо (+ необов'язковий .yaml з метаданими поруч)
+  workspace: workspace    # проміжні файли кожного відео
+  output: output          # готові .mp4 і обкладинки
+  assets: assets          # бібліотека фонів: assets/images/<категорія>/, assets/loops/<категорія>/
+  data: data              # база статусів, токени YouTube
+
+render:
+  width: 1920
+  height: 1080
+  fps: 30
+  encoder: auto           # auto | libx264 | h264_nvenc
+  crf: 20                 # якість libx264 (менше = краще, більший файл)
+  audio_bitrate: 192k
+  segment_seconds: 60     # довжина циклу, який потім повторюється (швидкий рендер)
+  zoom: 0.08              # амплітуда повільного наближення для картинок (0 = без руху)
+  loop_pingpong: false    # відео-луп вперед-назад для безшовного повтору
+  overlay_title: true     # назва теми внизу кадру
+  font: null              # шлях до .ttf з кирилицею; null = автопошук (DejaVu / Noto)
+
+visuals:
+  default_mode: image     # image | loop
+  default_category: abstract
+
+youtube:
+  client_secret: data/client_secret.json   # OAuth-клієнт (Desktop app) з Google Cloud Console
+  token: data/token.json
+  default_privacy: private                 # private | unlisted | public
+  playlist_privacy: public
+  category_id: "27"                        # 27 = Education
+  language: uk
+  made_for_kids: false
+  contains_synthetic_media: true           # позначка AI-контенту (голос згенерований)
+  daily_quota: 10000
+  upload_cost: 1600                        # вартість videos.insert у квоті; перевірте актуальне значення
+  auto_upload: false                       # `run` одразу завантажує після рендеру
+
+description:
+  footer: |
+    ———
+    Короткі розбори складних тем: щоб за 20 хвилин зрозуміти суть.
+    Озвучення згенеровано за допомогою AI.
+  default_tags: [пояснення, освіта]

@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.idea/
+
+# локальні налаштування і секрети
+config.yaml
+data/
+
+# медіа
+inbox/
+workspace/
+output/
+assets/**/*.mp4
+assets/**/*.mov
+assets/**/*.webm

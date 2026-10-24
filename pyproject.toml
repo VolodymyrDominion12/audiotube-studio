@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audiotube-studio"
+version = "0.1.0"
+description = "Локальний конвеєр: аудіорозбори -> YouTube-відео з фоном, обкладинкою і плейлистами"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.5",
+    "PyYAML>=6.0",
+    "Pillow>=10.0",
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.1",
+    "google-auth-httplib2>=0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+audiotube = "audiotube.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["audiotube*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
