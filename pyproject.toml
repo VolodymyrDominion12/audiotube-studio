@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audiotube-studio"
-version = "0.1.0"
+version = "0.2.0"
 description = "Локальний конвеєр: аудіорозбори -> YouTube-відео з фоном, обкладинкою і плейлистами"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,6 +17,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# av<16: PyAV 16+ прибрав metadata_errors, який використовує faster-whisper 1.2.x
+transcribe = ["faster-whisper>=1.1", "av>=11,<16"]
 dev = ["pytest>=7"]
 
 [project.scripts]

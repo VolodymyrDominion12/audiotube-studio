@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -66,6 +67,7 @@ class VideoMeta(BaseModel):
     category: str | None = None
     background: str | None = None  # явний шлях до картинки або відео
     thumbnail_text: str | None = None
+    visual_keywords: list[str] = Field(default_factory=list)
 
     # публікація
     privacy: Literal["private", "unlisted", "public"] | None = None
@@ -88,7 +90,7 @@ class VideoMeta(BaseModel):
             return parsed
         return v
 
-    @field_validator("tags", mode="before")
+    @field_validator("tags", "visual_keywords", mode="before")
     @classmethod
     def _parse_tags(cls, v):
         if v is None:
@@ -184,6 +186,7 @@ mode: {mode}              # image | loop
 category: {category}      # папка в assets/images/ або assets/loops/
 background: null          # або явний шлях до картинки/відео
 thumbnail_text: null      # короткий текст для обкладинки (2-4 слова)
+visual_keywords: []       # ключові слова для підбору фону (заповнює LLM)
 
 # Публікація
 privacy: null             # private | unlisted | public (null = з конфігу)
@@ -205,3 +208,72 @@ def write_sidecar_template(audio: Path, cfg: Config, overwrite: bool = False) ->
         encoding="utf-8",
     )
     return side
+
+
+# --- запис метаданих, згенерованих LLM ---------------------------------------
+def _yaml_scalar(value: str | None) -> str:
+    return "null" if value is None else json.dumps(value, ensure_ascii=False)
+
+
+def _yaml_block(text: str) -> str:
+    lines = text.splitlines() or [""]
+    return "\n".join(f"  {line}" if line.strip() else "" for line in lines)
+
+
+def dump_sidecar(meta: VideoMeta, header: str = "") -> str:
+    """Людиночитний YAML, який коректно читається назад через load_meta."""
+    lines: list[str] = []
+    for line in header.splitlines():
+        lines.append(f"# {line}" if line.strip() else "#")
+    if lines:
+        lines.append("")
+    lines.append(f"title: {_yaml_scalar(meta.title)}")
+    if meta.description.strip():
+        lines.append("description: |-")
+        lines.append(_yaml_block(meta.description.strip()))
+    else:
+        lines.append('description: ""')
+    lines.append("tags:" if meta.tags else "tags: []")
+    lines.extend(f"  - {_yaml_scalar(tag)}" for tag in meta.tags)
+    lines.append(f"playlist: {_yaml_scalar(meta.playlist)}")
+    if meta.chapters:
+        lines.append("chapters:")
+        lines.extend(f"  - {_yaml_scalar(f'{c.time} {c.title}')}" for c in meta.chapters)
+    else:
+        lines.append("chapters: []")
+    if meta.visual_keywords:
+        lines.append("visual_keywords:")
+        lines.extend(f"  - {_yaml_scalar(k)}" for k in meta.visual_keywords)
+    else:
+        lines.append("visual_keywords: []")
+    lines.append(f"thumbnail_text: {_yaml_scalar(meta.thumbnail_text)}")
+    lines.append("")
+    lines.append("# Візуал")
+    lines.append(f"mode: {_yaml_scalar(meta.mode)}")
+    lines.append(f"category: {_yaml_scalar(meta.category)}")
+    lines.append(f"background: {_yaml_scalar(meta.background)}")
+    lines.append("")
+    lines.append("# Публікація")
+    lines.append(f"privacy: {_yaml_scalar(meta.privacy)}")
+    lines.append(f"publish_at: {_yaml_scalar(meta.publish_at.isoformat() if meta.publish_at else None)}")
+    return "\n".join(lines) + "\n"
+
+
+def write_sidecar(audio: Path, meta: VideoMeta, header: str = "") -> Path:
+    side = sidecar_path(audio)
+    side.write_text(dump_sidecar(meta, header), encoding="utf-8")
+    return side
+
+
+def merge_generated_meta(existing: VideoMeta, generated: VideoMeta) -> VideoMeta:
+    """Згенерований контент + ручні налаштування (візуал, публікація) з наявного файлу."""
+    return generated.model_copy(
+        update={
+            "mode": existing.mode,
+            "category": existing.category,
+            "background": existing.background,
+            "privacy": existing.privacy,
+            "publish_at": existing.publish_at,
+            "thumbnail_text": existing.thumbnail_text or generated.thumbnail_text,
+        }
+    )

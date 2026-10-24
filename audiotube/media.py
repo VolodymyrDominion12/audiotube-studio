@@ -13,12 +13,34 @@ class FFmpegError(RuntimeError):
     pass
 
 
+def ffprobe_bin() -> str:
+    """Шукає ffprobe; snap-пакети ставлять його як `ffmpeg.ffprobe`."""
+    for name in ("ffprobe", "ffmpeg.ffprobe"):
+        path = shutil.which(name)
+        if path:
+            return path
+    raise FFmpegError(
+        "ffprobe не знайдено. Встановіть повний FFmpeg (Ubuntu/Debian: sudo apt install ffmpeg); "
+        "для snap-версії допоможе `sudo ln -s /snap/bin/ffmpeg.ffprobe /usr/local/bin/ffprobe`."
+    )
+
+
+def has_ffmpeg() -> bool:
+    if not shutil.which("ffmpeg"):
+        return False
+    try:
+        ffprobe_bin()
+        return True
+    except FFmpegError:
+        return False
+
+
 def require_ffmpeg() -> None:
-    for tool in ("ffmpeg", "ffprobe"):
-        if not shutil.which(tool):
-            raise FFmpegError(
-                f"{tool} не знайдено. Встановіть FFmpeg (Ubuntu/Debian: sudo apt install ffmpeg)."
-            )
+    if not shutil.which("ffmpeg"):
+        raise FFmpegError(
+            "ffmpeg не знайдено. Встановіть FFmpeg (Ubuntu/Debian: sudo apt install ffmpeg)."
+        )
+    ffprobe_bin()
 
 
 def run(cmd: list[str], desc: str = "ffmpeg", cwd: Path | None = None) -> None:
@@ -30,7 +52,7 @@ def run(cmd: list[str], desc: str = "ffmpeg", cwd: Path | None = None) -> None:
 
 def probe(path: Path) -> dict:
     proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        [ffprobe_bin(), "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     if proc.returncode != 0:

@@ -4,16 +4,19 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+.ruff_cache/
 .idea/
 
 # локальні налаштування і секрети
 config.yaml
+.env
 data/
 
 # медіа
 inbox/
 workspace/
 output/
+cache/
 assets/**/*.mp4
 assets/**/*.mov
 assets/**/*.webm

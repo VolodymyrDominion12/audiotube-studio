@@ -9,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 # статуси відео по черзі; кожен означає, що відповідний крок успішно завершено
-STATUSES = ("new", "rendered", "uploaded", "done")
+STATUSES = ("new", "transcribed", "described", "rendered", "uploaded", "done")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     duration REAL,
     video_id TEXT,
     playlist_id TEXT,
+    transcript TEXT,
+    subtitles TEXT,
+    captions_id TEXT,
     error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -32,6 +35,13 @@ CREATE TABLE IF NOT EXISTS quota (
     used INTEGER NOT NULL DEFAULT 0
 );
 """
+
+# колонки, додані після 0.1 — для баз, створених старішою версією
+_MIGRATIONS = {
+    "transcript": "TEXT",
+    "subtitles": "TEXT",
+    "captions_id": "TEXT",
+}
 
 
 def _now() -> str:
@@ -51,6 +61,9 @@ class Job:
     video_id: str | None
     playlist_id: str | None
     error: str | None
+    transcript: Path | None = None
+    subtitles: Path | None = None
+    captions_id: str | None = None
 
     @classmethod
     def from_row(cls, r: sqlite3.Row) -> "Job":
@@ -60,6 +73,9 @@ class Job:
             thumbnail=Path(r["thumbnail"]) if r["thumbnail"] else None,
             duration=r["duration"], video_id=r["video_id"],
             playlist_id=r["playlist_id"], error=r["error"],
+            transcript=Path(r["transcript"]) if r["transcript"] else None,
+            subtitles=Path(r["subtitles"]) if r["subtitles"] else None,
+            captions_id=r["captions_id"],
         )
 
     @property
@@ -73,12 +89,21 @@ class Database:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Додає колонки, яких немає у базі, створеній попередньою версією."""
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(jobs)")}
+        for column, sql_type in _MIGRATIONS.items():
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {sql_type}")
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
 
     # --- jobs -------------------------------------------------------------
-    def add_job(self, audio: Path, slug: str) -> Job | None:
+    def add_job(self, audio: Path, slug: str, title: str | None = None) -> Job | None:
         """Реєструє аудіо. Повертає None, якщо воно вже є в базі."""
         audio = audio.resolve()
         if self.conn.execute("SELECT 1 FROM jobs WHERE audio=?", (str(audio),)).fetchone():
@@ -88,8 +113,8 @@ class Database:
             slug, n = f"{base}-{n}", n + 1
         now = _now()
         cur = self.conn.execute(
-            "INSERT INTO jobs (audio, slug, status, created_at, updated_at) VALUES (?, ?, 'new', ?, ?)",
-            (str(audio), slug, now, now),
+            "INSERT INTO jobs (audio, slug, status, title, created_at, updated_at) VALUES (?, ?, 'new', ?, ?, ?)",
+            (str(audio), slug, title, now, now),
         )
         self.conn.commit()
         return self.get(cur.lastrowid)

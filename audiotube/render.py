@@ -110,16 +110,20 @@ def build_segment(bg: Background, cfg: Config, workdir: Path, title: str | None)
                "-vf", vf, "-frames:v", str(n), *codec, seg.name]
     else:
         base = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={fps},setsar=1"
+        clip_len = duration(bg.path)
         if r.loop_pingpong:
-            # вперед + назад: безшовний повтор для будь-якого кліпу (кліп обрізається до 20 с — reverse тримає кадри в пам'яті)
+            # вперед + назад: безшовний повтор для будь-якого кліпу. Reverse тримає кадри
+            # в пам'яті, тому шматок навмисно короткий (<=20 с).
+            part = max(1.0, min(20.0, float(r.segment_seconds), clip_len))
             fc = (
-                f"[0:v]trim=duration=20,setpts=PTS-STARTPTS,{base},split[a][b];"
+                f"[0:v]trim=duration={part:.3f},setpts=PTS-STARTPTS,{base},split[a][b];"
                 f"[b]reverse[rv];[a][rv]concat=n=2:v=1:a=0{overlay},format=yuv420p[v]"
             )
             cmd = ["ffmpeg", "-y", "-hide_banner", "-i", src, "-filter_complex", fc, "-map", "[v]", *codec, seg.name]
         else:
             vf = f"{base}{overlay},format=yuv420p"
-            cmd = ["ffmpeg", "-y", "-hide_banner", "-i", src, "-t", "180", "-vf", vf, *codec, seg.name]
+            segment = max(1, min(r.segment_seconds, int(clip_len)))
+            cmd = ["ffmpeg", "-y", "-hide_banner", "-i", src, "-t", str(segment), "-vf", vf, *codec, seg.name]
 
     run(cmd, "рендер сегмента", cwd=workdir)
     return seg
@@ -182,9 +186,42 @@ def make_thumbnail(bg: Background, text: str, cfg: Config, workdir: Path, out: P
     return out
 
 
+def burn_in_subtitles(video: Path, srt: Path, cfg: Config, workdir: Path) -> Path:
+    """Вшиває .srt у відео (окремий прохід перекодування — повільно, але універсально)."""
+    font = find_font(cfg)
+    fonts_dir = workdir / "fonts"
+    fonts_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(font, fonts_dir / font.name)
+    family = ImageFont.truetype(str(font), 20).getname()[0]
+    shutil.copyfile(srt, workdir / "subs.srt")
+
+    style = ",".join([
+        f"FontName={family}",
+        f"Fontsize={cfg.render.subtitle_font_size}",
+        f"MarginV={cfg.render.subtitle_margin}",
+        "PrimaryColour=&H00FFFFFF",
+        "OutlineColour=&H66000000",
+        "BorderStyle=1",
+        "Outline=2",
+        "Shadow=0",
+        "Alignment=2",
+    ])
+    tmp = video.with_name(f"{video.stem}_subs.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-i", str(video.resolve()),
+        "-vf", f"subtitles=subs.srt:fontsdir=fonts:force_style='{style}'",
+        *video_codec_args(pick_encoder(cfg.render.encoder), cfg.render.crf),
+        "-c:a", "copy", "-movflags", "+faststart", str(tmp.resolve()),
+    ]
+    run(cmd, "вшивання субтитрів", cwd=workdir)
+    tmp.replace(video)
+    return video
+
+
 def render_video(
     audio: Path, bg: Background, title: str, thumb_text: str, cfg: Config,
     workdir: Path, out_video: Path, out_thumb: Path, preview_seconds: float | None = None,
+    subtitles: Path | None = None,
 ) -> RenderResult:
     workdir.mkdir(parents=True, exist_ok=True)
     length = duration(audio)
@@ -192,5 +229,7 @@ def render_video(
         length = min(length, preview_seconds)
     seg = build_segment(bg, cfg, workdir, title)
     mux(seg, audio, out_video, cfg, length)
+    if subtitles and cfg.render.burn_subtitles:
+        burn_in_subtitles(out_video, subtitles, cfg, workdir)
     make_thumbnail(bg, thumb_text, cfg, workdir, out_thumb)
     return RenderResult(out_video, out_thumb, length, pick_encoder(cfg.render.encoder))

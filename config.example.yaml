@@ -3,10 +3,11 @@
 
 paths:
   inbox: inbox            # сюди кладете нові аудіо (+ необов'язковий .yaml з метаданими поруч)
-  workspace: workspace    # проміжні файли кожного відео
+  workspace: workspace    # проміжні файли кожного відео (транскрипт, субтитри, plan.json)
   output: output          # готові .mp4 і обкладинки
   assets: assets          # бібліотека фонів: assets/images/<категорія>/, assets/loops/<категорія>/
   data: data              # база статусів, токени YouTube
+  cache: cache            # кеш зовнішніх завантажень (моделі, фони)
 
 render:
   width: 1920
@@ -20,10 +21,52 @@ render:
   loop_pingpong: false    # відео-луп вперед-назад для безшовного повтору
   overlay_title: true     # назва теми внизу кадру
   font: null              # шлях до .ttf з кирилицею; null = автопошук (DejaVu / Noto)
+  burn_subtitles: false   # вшити субтитри у відео (повільний прохід перекодування)
+  subtitle_font_size: 40
+  subtitle_margin: 60
 
 visuals:
   default_mode: image     # image | loop
   default_category: abstract
+
+transcribe:
+  backend: auto           # auto | faster-whisper | whisper-cli | openai | none
+  model: small            # tiny | base | small | medium | large-v3 (faster-whisper)
+  language: uk
+  device: auto            # auto | cpu | cuda
+  compute_type: int8      # int8 (CPU) | float16 (GPU) | auto
+  beam_size: 5
+  vad: true               # відсікати тишу (швидше, менше галюцинацій)
+  model_dir: null         # куди завантажувати моделі; null = ~/.cache/huggingface
+  command: null           # whisper.cpp: напр. whisper-cli (null = автопошук)
+  model_path: null        # whisper.cpp: шлях до ggml-моделі
+  base_url: null          # OpenAI-сумісний API; null = https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  timeout: 600
+  max_chars: 42           # символів у рядку субтитра
+  max_lines: 2            # рядків у субтитрі
+
+llm:
+  provider: ollama        # ollama | openai | anthropic | none
+  model: qwen2.5:7b       # для ollama: назва з `ollama list`; для API — id моделі
+  base_url: null          # null = http://127.0.0.1:11434 (ollama) / api.openai.com / api.anthropic.com
+  api_key_env: null       # null = OPENAI_API_KEY / ANTHROPIC_API_KEY
+  temperature: 0.4
+  timeout: 180
+  max_tokens: 4096
+  retries: 1              # скільки разів просити виправлення невалідного JSON
+
+plan:
+  known_playlists: []     # напр. ["DevOps за 20 хвилин", "Фізика за 20 хвилин"]
+  default_playlist: null  # якщо LLM не запропонує плейлист
+  min_chapters: 4
+  max_chapters: 10
+  max_transcript_chars: 24000   # скільки символів транскрипту віддавати LLM
+
+pipeline:
+  auto_transcribe: true   # `run`/`watch` роблять транскрипцію
+  auto_describe: true     # `run`/`watch` генерують метадані через LLM
+  auto_render: true
 
 youtube:
   client_secret: data/client_secret.json   # OAuth-клієнт (Desktop app) з Google Cloud Console
@@ -36,6 +79,10 @@ youtube:
   contains_synthetic_media: true           # позначка AI-контенту (голос згенерований)
   daily_quota: 10000
   upload_cost: 1600                        # вартість videos.insert у квоті; перевірте актуальне значення
+  upload_captions: true                    # завантажувати subtitles.srt на YouTube
+  captions_language: uk
+  captions_name: Українська
+  captions_cost: 400                       # вартість captions.insert у квоті
   auto_upload: false                       # `run` одразу завантажує після рендеру
 
 description:

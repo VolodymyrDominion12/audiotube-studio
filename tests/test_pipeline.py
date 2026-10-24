@@ -11,7 +11,14 @@ from audiotube.config import load_config
 from audiotube.media import duration
 from audiotube.pipeline import Pipeline
 
-HAS_FFMPEG = shutil.which("ffmpeg") is not None
+def _ffmpeg_works() -> bool:
+    try:
+        return subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=15).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+HAS_FFMPEG = _ffmpeg_works() and bool(shutil.which("ffprobe") or shutil.which("ffmpeg.ffprobe"))
 
 
 class FakePublisher:
@@ -41,9 +48,13 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(main(["--root", str(self.tmp), "init"]), 0)
         audio = self.tmp / "inbox" / "Що_таке_Docker.mp3"
-        subprocess.run(
-            ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=12", str(audio)], check=True
-        )
+        try:
+            subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=12", str(audio)],
+                check=True, capture_output=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as e:
+            self.skipTest(f"ffmpeg недоступний у цьому середовищі: {e}")
         self.assertEqual(main(["--root", str(self.tmp), "meta", str(audio)]), 0)
         side = audio.with_suffix(".yaml")
         side.write_text(

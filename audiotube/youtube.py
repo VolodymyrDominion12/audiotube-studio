@@ -21,6 +21,7 @@ SCOPES = [
 
 COST_WRITE = 50
 COST_READ = 1
+COST_CAPTION = 400
 RETRIABLE_STATUS = {500, 502, 503, 504}
 
 
@@ -164,8 +165,33 @@ class Publisher:
                 return False
             raise
 
-    # --- плейлисти -------------------------------------------------------------
-    def list_playlists(self) -> list[dict]:
+    # --- субтитри --------------------------------------------------------------
+    def set_captions(self, video_id: str, srt: Path) -> str | None:
+        """Завантажує .srt як субтитри відео. None — якщо YouTube відмовив (не критично)."""
+        from googleapiclient.errors import HttpError
+        from googleapiclient.http import MediaFileUpload
+
+        yt = self.cfg.youtube
+        body = {
+            "snippet": {
+                "videoId": video_id,
+                "language": yt.captions_language or yt.language,
+                "name": yt.captions_name or yt.captions_language,
+                "isDraft": False,
+            }
+        }
+        self._spend(self.cfg.youtube.captions_cost, "субтитри")
+        media = MediaFileUpload(str(srt), mimetype="application/octet-stream", resumable=False)
+        try:
+            resp = self.yt.captions().insert(part="snippet", body=body, media_body=media).execute()
+            return resp.get("id")
+        except HttpError as e:
+            if e.resp.status in (400, 403, 409):
+                self.log(f"    ! субтитри не додано (HTTP {e.resp.status}): {e}")
+                return None
+            raise
+
+    # --- плейлисти -------------------------------------------------------------    def list_playlists(self) -> list[dict]:
         items, token = [], None
         while True:
             self._spend(COST_READ, "список плейлистів")

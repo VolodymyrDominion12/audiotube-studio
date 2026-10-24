@@ -61,7 +61,11 @@ def choose_background(meta: VideoMeta, cfg: Config, slug: str, workdir: Path) ->
         return Background(p, kind, "explicit")
 
     category = meta.category or cfg.visuals.default_category
-    keywords = {slugify(t) for t in meta.tags} | set(slugify(meta.title).split("-"))
+    keywords = (
+        {slugify(t) for t in meta.tags}
+        | {slugify(t) for t in meta.visual_keywords}
+        | set(slugify(meta.title).split("-"))
+    )
     keywords = {k for k in keywords if len(k) >= 3}
 
     if mode == "loop":

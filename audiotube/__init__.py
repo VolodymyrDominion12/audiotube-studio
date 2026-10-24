@@ -1,6 +1,6 @@
 """AudioTube Studio: аудіорозбори -> YouTube-відео."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
