@@ -3,6 +3,7 @@
 Локальний конвеєр: аудіорозбори → транскрипт і субтитри → метадані (назва, опис, теги, глави,
 плейлист) → відео з фоном і обкладинкою → завантаження на YouTube.
 
+- **Специфікації (spec-driven development):** [specs/README.md](specs/README.md) — спершу спека, потім код
 - Концепція і план розвитку: [docs/01_CONCEPT.md](docs/01_CONCEPT.md)
 - План інтеграції з NotebookLM (синхронізація аудіопереказів → папки → автопублікація): [docs/05_NOTEBOOKLM_PLAN.md](docs/05_NOTEBOOKLM_PLAN.md)
 - Автоматика (демон, systemd, квота): [docs/06_AUTOMATION.md](docs/06_AUTOMATION.md)
