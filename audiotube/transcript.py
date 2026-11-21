@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-MIN_CUE_SECONDS = 0.8
+MIN_CUE_SECONDS = 1.0
 MAX_PROMPT_CHARS = 24000
 
 
@@ -87,13 +88,21 @@ def _split_long_word(word: str, max_chars: int) -> list[str]:
     return [word[i:i + max_chars] for i in range(0, len(word), max_chars)] or [word]
 
 
-def wrap_text(text: str, max_chars: int = 42) -> list[str]:
-    """Розбиває текст на рядки не довші за max_chars (слова не рвуться без потреби)."""
+def _tokens(text: str, max_chars: int) -> list[str]:
+    """Слова тексту; слово, довше за max_chars, ріжеться на шматки (інакше рядок не вмістити)."""
     words: list[str] = []
     for word in re.sub(r"\s+", " ", text).strip().split(" "):
-        if not word:
-            continue
-        words.extend(_split_long_word(word, max_chars) if len(word) > max_chars else [word])
+        if word:
+            words.extend(_split_long_word(word, max_chars) if len(word) > max_chars else [word])
+    return words
+
+
+def wrap_text(text: str, max_chars: int = 42) -> list[str]:
+    """Розбиває текст на рядки не довші за max_chars (слова не рвуться без потреби)."""
+    return _greedy_lines(_tokens(text, max_chars), max_chars)
+
+
+def _greedy_lines(words: list[str], max_chars: int) -> list[str]:
     if not words:
         return []
     lines, current = [], words[0]
@@ -107,6 +116,94 @@ def wrap_text(text: str, max_chars: int = 42) -> list[str]:
     return lines
 
 
+# --- правила субтитрів (spec 009) --------------------------------------------
+@dataclass(frozen=True)
+class SubtitleRules:
+    max_chars: int = 42
+    max_lines: int = 2
+    max_seconds: float = 7.0  # SUB-R1
+    min_seconds: float = MIN_CUE_SECONDS  # SUB-R2
+    max_cps: float = 17.0  # SUB-R3, символів (без пробілів) за секунду
+    merge_gap: float = 0.3  # SUB-R6
+
+    @classmethod
+    def from_config(cls, cfg) -> "SubtitleRules":
+        t = cfg.transcribe
+        return cls(
+            max_chars=t.max_chars,
+            max_lines=t.max_lines,
+            max_seconds=float(t.max_cue_seconds),
+            min_seconds=float(t.min_cue_seconds),
+            max_cps=float(t.max_cps),
+        )
+
+
+_SENTENCE_END = re.compile(r"[.!?…]+[\"»)\]]*$")
+_CLAUSE_END = re.compile(r"[,;:]+[\"»)\]]*$|[—–]$")
+_DASHES = {"—", "–", "-"}
+_BONUS = {2: 0.35, 1: 0.2, 0: 0.0}  # перевага точки поділу над серединою (SUB-R4)
+_PUNCT_SLACK = 1.3  # SUB-R5: розрив на розділовому знаку, якщо довший рядок ≤ 130 % найкращого
+
+
+def _break_level(words: list[str], i: int) -> int:
+    """Рівень розриву ПІСЛЯ words[i]: 2 — кінець речення, 1 — межа фрази, 0 — просто пробіл."""
+    word = words[i]
+    if _SENTENCE_END.search(word):
+        return 2
+    if _CLAUSE_END.search(word) or (i + 1 < len(words) and words[i + 1] in _DASHES):
+        return 1
+    return 0
+
+
+def _layout_lines(words: list[str], rules: SubtitleRules) -> tuple[str, ...] | None:
+    """Рядки титра (SUB-R5, R9) або None, якщо текст не вміщається в max_lines."""
+    text = " ".join(words)
+    if len(text) <= rules.max_chars:
+        return (text,)
+    greedy = _greedy_lines(words, rules.max_chars)
+    if len(greedy) > rules.max_lines:
+        return None
+    if len(greedy) > 2:
+        return tuple(greedy)
+    options = []  # (довший рядок, чи після розділового знака, індекс розриву)
+    for b in range(1, len(words)):
+        left, right = " ".join(words[:b]), " ".join(words[b:])
+        if len(left) <= rules.max_chars and len(right) <= rules.max_chars:
+            options.append((max(len(left), len(right)), _break_level(words, b - 1) > 0, b))
+    best = min(longer for longer, _, _ in options)
+    punct = [o for o in options if o[1] and o[0] <= best * _PUNCT_SLACK]
+    if punct:
+        _, _, b = min(punct, key=lambda o: (o[0], o[2]))
+    else:
+        _, _, b = min(options, key=lambda o: (o[0], not o[1], o[2]))
+    return (" ".join(words[:b]), " ".join(words[b:]))
+
+
+def _split_words(words: list[str], seconds_per_char: float, rules: SubtitleRules) -> list[list[str]]:
+    """Ділить слова сегмента на титри: вміщаються в рядки і в max_seconds (SUB-R1, R4).
+
+    Рекурсивно ріжемо в найкращій точці: найвищий рівень розриву, ближче до середини.
+    """
+    pieces: list[list[str]] = []
+    stack = [words]
+    while stack:
+        part = stack.pop()
+        text_len = len(" ".join(part))
+        fits = (text_len + 1) * seconds_per_char <= rules.max_seconds + 1e-9 and _layout_lines(part, rules)
+        if fits or len(part) == 1:
+            pieces.append(part)
+            continue
+        best_b, best_score, left_len = 1, None, -1
+        for b in range(1, len(part)):
+            left_len += len(part[b - 1]) + 1
+            score = _BONUS[_break_level(part, b - 1)] - abs(left_len / text_len - 0.5)
+            if best_score is None or score > best_score + 1e-12:
+                best_b, best_score = b, score
+        stack.append(part[best_b:])  # стек: права частина обробиться після лівої
+        stack.append(part[:best_b])
+    return pieces
+
+
 @dataclass(frozen=True)
 class Cue:
     start: float
@@ -118,38 +215,75 @@ class Cue:
         return "\n".join(self.lines)
 
 
-def build_cues(
-    segments: list[Segment], max_chars: int = 42, max_lines: int = 2, min_seconds: float = MIN_CUE_SECONDS
-) -> list[Cue]:
-    """Перетворює сегменти у субтитри: не більше max_lines рядків, час — пропорційно тексту."""
-    raw: list[tuple[float, float, list[str]]] = []
+@dataclass(frozen=True)
+class CueLayout:
+    cues: list[Cue]
+    dense: int = 0  # титри, швидкість читання яких лишилася > max_cps (SUB-R3)
+
+
+def _visible_chars(lines: tuple[str, ...]) -> int:
+    return sum(len(line.replace(" ", "")) for line in lines)
+
+
+def layout_cues(
+    segments: list[Segment], rules: SubtitleRules | None = None, duration: float | None = None
+) -> CueLayout:
+    """Сегменти → титри за правилами spec 009. duration — межа для останнього титра."""
+    rules = rules or SubtitleRules()
+    raw: list[tuple[float, float, tuple[str, ...]]] = []
     for seg in segments:
         start, end = float(seg.start), float(seg.end)
-        if end <= start or not seg.text.strip():
+        words = _tokens(seg.text, rules.max_chars)
+        if end <= start or not words:
             continue
-        lines = wrap_text(seg.text, max_chars)
-        if not lines:
-            continue
-        chunks = [lines[i:i + max_lines] for i in range(0, len(lines), max_lines)]
-        weights = [sum(len(line) for line in chunk) for chunk in chunks]
-        total = sum(weights) or 1
+        per_char = (end - start) / (len(" ".join(words)) + 1)
         cursor = start
-        for chunk, weight in zip(chunks, weights):
-            duration = (end - start) * weight / total
-            raw.append((cursor, cursor + duration, chunk))
-            cursor += duration
+        for piece in _split_words(words, per_char, rules):
+            lines = _layout_lines(piece, rules) or tuple(_greedy_lines(piece, rules.max_chars))
+            span = (len(" ".join(piece)) + 1) * per_char
+            raw.append((cursor, cursor + span, lines))
+            cursor += span
+    raw.sort(key=lambda r: r[0])
 
-    # вирівнювання: мінімальна тривалість, без перекриттів і без «нульових» титрів
+    # вирівнювання часу: SUB-R1 (стеля), R2 (мінімум), R3 (швидкість читання), R6 (короткі паузи)
     cues: list[Cue] = []
+    dense = 0
     for i, (start, end, lines) in enumerate(raw):
-        next_start = raw[i + 1][0] if i + 1 < len(raw) else None
-        end = max(end, start + min_seconds)
-        if next_start is not None:
-            end = min(end, next_start)
-        if end - start < 0.05:
-            continue
-        cues.append(Cue(round(start, 3), round(end, 3), tuple(lines)))
-    return cues
+        cap = start + rules.max_seconds
+        if i + 1 < len(raw):
+            limit = raw[i + 1][0]
+        elif duration is not None:
+            limit = max(duration, start)
+        else:
+            limit = max(end, start + rules.min_seconds)  # без тривалості аудіо — як раніше
+        chars = _visible_chars(lines)
+        want = max(min(end, cap), start + rules.min_seconds, start + chars / rules.max_cps)
+        want = min(want, cap, limit)
+        if i + 1 < len(raw) and 0 < limit - want < rules.merge_gap and limit <= cap:
+            want = limit
+        start_r = round(start, 3)
+        # вгору — щоб округлення не зробило титр «щільним»; але не за наступний титр і не за стелю
+        end_r = min(
+            math.ceil(want * 1000 - 1e-6) / 1000, round(limit, 3), round(start_r + rules.max_seconds, 3)
+        )
+        if end_r - start_r < 0.001:
+            continue  # наступний титр починається там само (перекриті сегменти)
+        if chars / (end_r - start_r) > rules.max_cps + 1e-6:
+            dense += 1
+        cues.append(Cue(start_r, end_r, lines))
+    return CueLayout(cues, dense)
+
+
+def build_cues(
+    segments: list[Segment],
+    max_chars: int = 42,
+    max_lines: int = 2,
+    min_seconds: float = MIN_CUE_SECONDS,
+    rules: SubtitleRules | None = None,
+) -> list[Cue]:
+    """Сегменти → титри (сумісна обгортка над layout_cues)."""
+    rules = rules or SubtitleRules(max_chars=max_chars, max_lines=max_lines, min_seconds=min_seconds)
+    return layout_cues(segments, rules).cues
 
 
 def to_srt(cues: list[Cue]) -> str:
@@ -160,10 +294,23 @@ def to_srt(cues: list[Cue]) -> str:
     return "\n".join(blocks)
 
 
-def write_srt(transcript: Transcript, path: Path, max_chars: int = 42, max_lines: int = 2) -> Path:
-    cues = build_cues(transcript.segments, max_chars=max_chars, max_lines=max_lines)
+def render_srt(transcript: Transcript, rules: SubtitleRules | None = None) -> tuple[str, CueLayout]:
+    """SRT-текст і розкладка (для журналу «щільних» титрів)."""
+    layout = layout_cues(transcript.segments, rules, duration=transcript.duration or None)
+    return to_srt(layout.cues), layout
+
+
+def write_srt(
+    transcript: Transcript,
+    path: Path,
+    max_chars: int = 42,
+    max_lines: int = 2,
+    rules: SubtitleRules | None = None,
+) -> Path:
+    rules = rules or SubtitleRules(max_chars=max_chars, max_lines=max_lines)
+    text, _ = render_srt(transcript, rules)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(to_srt(cues), encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
     return path
 
 

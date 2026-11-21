@@ -45,6 +45,9 @@ transcribe:
   timeout: 600
   max_chars: 42           # символів у рядку субтитра
   max_lines: 2            # рядків у субтитрі
+  max_cue_seconds: 7      # найдовший титр на екрані, с (2–15)
+  min_cue_seconds: 1      # найкоротший, якщо не налазить на наступний, с
+  max_cps: 17             # швидкість читання, символів за секунду (8–30)
 
 llm:
   provider: ollama        # ollama | openai | anthropic | none

@@ -48,7 +48,7 @@ draft → approved → in-progress → implemented
 | 006 | [Ноутбук → плейлист](006-notebook-playlists/spec.md) | draft (відкладено) | `youtube.py`, `sync.py` |
 | 007 | [Сповіщення в Telegram](007-telegram-notify/spec.md) | implemented | `notify.py`, `daemon.py` |
 | 008 | [Вкладка «Ноутбуки» у веб-UI](008-webui-notebooks/spec.md) | implemented | `webui.py`, `db.py` |
-| 009 | [Поділ субтитрів за часом і швидкістю читання](009-subtitle-timing/spec.md) | approved | `transcript.py`, `cli.py` |
+| 009 | [Поділ субтитрів за часом і швидкістю читання](009-subtitle-timing/spec.md) | implemented | `transcript.py`, `subtitles.py` |
 
 Спеки 001–004 написані **після** коду (reverse-engineered): вони фіксують поточну поведінку
 як контракт, щоб подальші зміни не ламали її непомітно.

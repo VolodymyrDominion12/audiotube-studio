@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class PathsCfg(BaseModel):
@@ -62,6 +62,15 @@ class TranscribeCfg(BaseModel):
     # субтитри
     max_chars: int = Field(42, ge=20, le=120)  # символів у рядку субтитра
     max_lines: int = Field(2, ge=1, le=4)
+    max_cue_seconds: float = Field(7.0, ge=2, le=15)  # spec 009: найдовший титр
+    min_cue_seconds: float = Field(1.0, ge=0.3, le=3)  # найкоротший, якщо не налазить на наступний
+    max_cps: float = Field(17, ge=8, le=30)  # швидкість читання, символів за секунду
+
+    @model_validator(mode="after")
+    def _cue_bounds(self):
+        if self.min_cue_seconds >= self.max_cue_seconds:
+            raise ValueError("transcribe.min_cue_seconds має бути менше за max_cue_seconds")
+        return self
 
 
 class LLMCfg(BaseModel):

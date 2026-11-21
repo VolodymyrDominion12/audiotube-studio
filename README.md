@@ -52,6 +52,7 @@ cp ~/Downloads/docker_za_20_khvylyn.mp3 inbox/
 # 2. Транскрипт + субтитри (локально)
 audiotube transcribe
 #    workspace/<slug>/transcript.json, workspace/<slug>/subtitles.srt
+#    правила нарізки субтитрів і `audiotube subtitles` — docs/04, розд. 1.5
 
 # 3. Метадані через LLM (потрібна Ollama або API-ключ)
 audiotube describe
@@ -267,7 +268,7 @@ audiotube/
   daemon.py      автоматичний цикл: бюджет, повтори, лок, очищення
   notify.py      сповіщення демона: Telegram / notify-send
   db.py          SQLite (data/audiotube.db)
-tests/           145 тестів; синк, демон і публікація — без мережі й FFmpeg
+tests/           161 тест; синк, демон і публікація — без мережі й FFmpeg
 deploy/systemd/  готові unit-файли для автозапуску
 docs/            концепція, аудит, інструкції
 ```

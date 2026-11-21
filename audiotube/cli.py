@@ -6,6 +6,7 @@
     audiotube meta <аудіо>             створити шаблон метаданих поруч з аудіо
     audiotube scan                     зареєструвати нові аудіо з inbox/
     audiotube transcribe [id ...]      транскрипція -> transcript.json + subtitles.srt
+    audiotube subtitles [id ...]       перебудувати subtitles.srt з транскрипту (без Whisper)
     audiotube describe [id ...]        LLM-генерація назви/опису/тегів/глав/плейлиста
     audiotube render [id ...]          відрендерити відео й обкладинку
     audiotube auth                     авторизація YouTube (один раз)
@@ -188,6 +189,22 @@ def cmd_transcribe(args) -> int:
         job = pipe.transcribe(job, force=args.force)
         failed += bool(job.error)
     return 1 if failed else 0
+
+
+def cmd_subtitles(args) -> int:
+    """Spec 009: субтитри за поточними правилами з наявного transcript.json."""
+    from audiotube.subtitles import describe, rebuild_subtitles
+
+    cfg = _cfg(args)
+    with Database(cfg.db_path) as db:
+        report = rebuild_subtitles(cfg, db, args.ids or None, force=args.force, dry_run=args.dry_run)
+    if not report.items:
+        print("задач немає")
+    for item in report.items:
+        print(describe(item, dry_run=args.dry_run))
+    if args.dry_run:
+        print("[dry-run] нічого не змінено")
+    return report.exit_code
 
 
 def cmd_describe(args) -> int:
@@ -584,6 +601,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("ids", nargs="*", type=int)
     s.add_argument("--force", action="store_true", help="перезаписати наявний транскрипт")
     s.set_defaults(func=cmd_transcribe)
+
+    s = sub.add_parser("subtitles", help="перебудувати subtitles.srt з транскрипту за правилами spec 009")
+    s.add_argument("ids", nargs="*", type=int, help="id задач (без id — усі з транскриптом)")
+    s.add_argument("--force", action="store_true", help="перебудувати наявні SRT (стара версія → .bak)")
+    s.add_argument("--dry-run", action="store_true", help="показати, що зміниться, нічого не писати")
+    s.set_defaults(func=cmd_subtitles)
 
     s = sub.add_parser("describe", aliases=["plan"], help="LLM: назва, опис, теги, глави, плейлист")
     s.add_argument("ids", nargs="*", type=int)

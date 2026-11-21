@@ -31,7 +31,7 @@ from audiotube.transcribe import (
     TranscriptionError,
     transcribe_audio,
 )
-from audiotube.transcript import Transcript, write_srt
+from audiotube.transcript import SubtitleRules, Transcript, write_srt
 from audiotube.visuals import choose_background
 
 # порядок кроків: більший індекс — далі по конвеєру
@@ -284,7 +284,7 @@ class Pipeline:
             try:
                 srt = write_srt(
                     Transcript.load(transcript), workdir / SUBTITLES_NAME,
-                    max_chars=self.cfg.transcribe.max_chars, max_lines=self.cfg.transcribe.max_lines,
+                    rules=SubtitleRules.from_config(self.cfg),
                 )
             except Exception:  # noqa: BLE001 — субтитри не критичні для рендеру
                 return None

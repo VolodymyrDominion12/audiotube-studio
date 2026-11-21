@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from audiotube.config import Config
-from audiotube.transcript import Segment, Transcript, write_srt
+from audiotube.transcript import Segment, SubtitleRules, Transcript, render_srt
 
 TRANSCRIPT_NAME = "transcript.json"
 SUBTITLES_NAME = "subtitles.srt"
@@ -151,8 +151,12 @@ def transcribe_audio(
         raise TranscriptionError("транскрипція не дала жодного сегмента (можливо, файл без мовлення)")
     transcript.backend = backend
     transcript.save(json_path)
-    write_srt(transcript, srt_path, max_chars=cfg.transcribe.max_chars, max_lines=cfg.transcribe.max_lines)
-    log(f"    готово: {len(transcript.segments)} сегментів, {len(transcript.text)} символів")
+    srt_text, layout = render_srt(transcript, SubtitleRules.from_config(cfg))
+    srt_path.write_text(srt_text, encoding="utf-8")
+    log(f"    готово: {len(transcript.segments)} сегментів, {len(transcript.text)} символів, "
+        f"{len(layout.cues)} титрів")
+    if layout.dense:
+        log(f"    щільних титрів (швидше за {cfg.transcribe.max_cps:g} симв./с): {layout.dense}")
     return TranscriptionResult(transcript, json_path, srt_path)
 
 
