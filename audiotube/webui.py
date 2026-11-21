@@ -5,6 +5,9 @@
 Дає те, що потрібно для ручної перевірки перед публікацією: черга задач, прев'ю,
 редагування YAML-метаданих, кнопки транскрипції/рендеру/завантаження.
 Кожен запит створює власне з'єднання SQLite і виконується в окремому потоці.
+
+Сторінка `/notebooks` (spec 008) показує ноутбуки NotebookLM → перекази → відео і дає запустити
+синк; справжній синк бере той самий `data/daemon.lock`, що й демон.
 """
 
 from __future__ import annotations
@@ -20,10 +23,13 @@ from urllib.parse import unquote, urlparse
 import yaml
 
 from audiotube.config import Config
-from audiotube.db import Job
+from audiotube.daemon import daemon_lock, next_upload_at
+from audiotube.db import Database, Job, QuotaTracker
 from audiotube.media import has_ffmpeg
 from audiotube.metadata import MetadataError, VideoMeta, dump_sidecar, load_meta, sidecar_path
+from audiotube.notebooklm import Adapter
 from audiotube.pipeline import Pipeline
+from audiotube.sync import SyncReport, SyncService
 
 MAX_BODY = 1_000_000
 PREVIEW_SECONDS = 20.0
@@ -31,6 +37,14 @@ PREVIEW_SECONDS = 20.0
 
 class WebError(RuntimeError):
     pass
+
+
+class NotFound(WebError):
+    """404: запитаного об'єкта немає."""
+
+
+class Busy(WebError):
+    """409: ресурс зайнятий (напр. замок демона)."""
 
 
 def _rel(cfg: Config, path: Path | None) -> str | None:
@@ -86,10 +100,17 @@ def save_meta_text(job: Job, text: str) -> None:
 
 
 class WebApp:
-    def __init__(self, cfg: Config, host: str = "127.0.0.1", port: int = 8765):
+    def __init__(
+        self,
+        cfg: Config,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+        adapter: Adapter | None = None,
+    ):
         self.cfg = cfg
         self.host = host
         self.port = port
+        self.adapter = adapter  # None → справжній NotebookLM (build_adapter у SyncService)
         self.lock = threading.Lock()
 
     # --- серіалізація стану --------------------------------------------------
@@ -182,6 +203,75 @@ class WebApp:
             finally:
                 pipe.db.close()
 
+    # --- ноутбуки (spec 008) -------------------------------------------------
+    def notebooks(self) -> dict:
+        """WEB-R1: ноутбуки з лічильниками."""
+        with Database(self.cfg.db_path) as db:
+            rows = db.notebook_stats()
+        keys = ("id", "title", "slug", "url", "sources", "synced_at",
+                "downloaded", "missing", "published", "errors", "queued")
+        return {"ok": True, "notebooks": [{k: r[k] for k in keys} for r in rows]}
+
+    def notebook(self, notebook_id: str) -> dict:
+        """WEB-R2: перекази одного ноутбука."""
+        with Database(self.cfg.db_path) as db:
+            nb = db.notebook(notebook_id)
+            if nb is None:
+                raise NotFound(f"ноутбук {notebook_id} не знайдено")
+            rows = db.notebook_items(notebook_id)
+        items = [
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "created_at": r["created_at"],
+                "duration": r["duration"],
+                "state": r["state"],
+                "job_id": r["job_id"],
+                "job_status": r["job_status"],
+                "attempts": r["attempts"],
+                "url": f"https://youtu.be/{r['video_id']}" if r["video_id"] else None,
+                "error": r["error"].splitlines()[0] if r["error"] else None,
+            }
+            for r in rows
+        ]
+        notebook = {k: nb[k] for k in ("id", "title", "slug", "url", "sources", "synced_at")}
+        return {"ok": True, "notebook": notebook, "items": items}
+
+    def daemon_state(self) -> dict:
+        """WEB-R5: бюджет, квота, наступне вікно публікації, чи працює демон."""
+        with Database(self.cfg.db_path) as db:
+            quota = QuotaTracker(db, self.cfg.youtube.daily_quota)
+            nxt = next_upload_at(self.cfg, db)
+            data = {
+                "uploads_today": db.uploads_count(),
+                "videos_per_day": self.cfg.daemon.videos_per_day,
+                "quota": {"remaining": quota.remaining(), "limit": quota.daily_limit},
+                "next_upload_at": nxt.isoformat(timespec="seconds") if nxt else None,
+            }
+        data["running"] = daemon_lock(self.cfg).is_locked()
+        data["ok"] = True
+        return data
+
+    def sync(self, dry_run: bool) -> dict:
+        """WEB-R3/R4: синк з UI. Справжній — лише під замком демона, dry-run — без замка."""
+        logs: list[str] = []
+        lock = daemon_lock(self.cfg)
+        if not dry_run and not lock.acquire():
+            raise Busy("демон уже працює (замок зайнятий) — синк з UI не запущено, спробуйте пізніше")
+        try:
+            with Database(self.cfg.db_path) as db:
+                service = SyncService(self.cfg, db=db, adapter=self.adapter, log=logs.append)
+                report = service.run(dry_run=dry_run)
+        finally:
+            lock.release()
+        return {
+            "ok": True,
+            "dry_run": dry_run,
+            "report": report_json(report),
+            "log": logs,
+            "message": _sync_summary(report, dry_run),
+        }
+
     # --- медіа ---------------------------------------------------------------
     def media_path(self, rel: str) -> Path | None:
         rel = unquote(rel).lstrip("/")
@@ -197,6 +287,35 @@ class WebApp:
         if not any(_is_under(target, base) for base in allowed):
             return None
         return target if target.is_file() else None
+
+
+def report_json(report: SyncReport) -> dict:
+    return {
+        "notebooks": report.notebooks,
+        "downloaded": report.downloaded,
+        "skipped": report.skipped,
+        "planned": report.planned,
+        "missing": report.missing,
+        "restored": report.restored,
+        "changed": report.changed,
+        "errors": list(report.errors),
+        "items": [
+            {"action": i.action, "notebook": i.notebook, "title": i.title, "message": i.message}
+            for i in report.items
+        ],
+    }
+
+
+def _sync_summary(report: SyncReport, dry_run: bool) -> str:
+    head = f"план: до завантаження {report.planned}" if dry_run else f"скачано {report.downloaded}"
+    parts = [head, f"пропущено {report.skipped}"]
+    if report.missing:
+        parts.append(f"зникли {report.missing}")
+    if report.restored:
+        parts.append(f"повернулися {report.restored}")
+    if report.errors:
+        parts.append(f"помилок {len(report.errors)}")
+    return ", ".join(parts)
 
 
 def _is_under(path: Path, base: Path) -> bool:
@@ -288,8 +407,16 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if not parts or parts[0] == "index.html":
                 self._send(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
+            elif parts[0] == "notebooks" and len(parts) <= 2:
+                self._send(200, NOTEBOOKS_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif parts == ["api", "state"]:
                 self._json(200, self.app.state())
+            elif parts == ["api", "notebooks"]:
+                self._json(200, self.app.notebooks())
+            elif len(parts) == 3 and parts[:2] == ["api", "notebooks"]:
+                self._json(200, self.app.notebook(unquote(parts[2])))
+            elif parts == ["api", "daemon"]:
+                self._json(200, self.app.daemon_state())
             elif len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "meta":
                 self._json(200, self.app.meta(int(parts[2])))
             elif len(parts) >= 2 and parts[0] == "media":
@@ -301,6 +428,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_file(path, ctype)
             else:
                 self._error(404, "немає такого маршруту")
+        except NotFound as e:
+            self._error(404, str(e))
         except (WebError, RuntimeError) as e:
             self._error(400, str(e))
         except Exception as e:  # noqa: BLE001 — веб-сервер не має падати через одну дію
@@ -311,12 +440,19 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if parts == ["api", "scan"]:
                 self._json(200, self.app.scan())
+            elif parts == ["api", "sync"]:
+                dry_run = "dry_run=1" in (urlparse(self.path).query or "")
+                self._json(200, self.app.sync(dry_run=dry_run))
             elif len(parts) == 4 and parts[:2] == ["api", "jobs"]:
                 force = "force=1" in (urlparse(self.path).query or "")
                 self._json(200, self.app.action(int(parts[2]), parts[3], force=force))
             else:
                 self._error(404, "немає такого маршруту")
-        except RuntimeError as e:  # WebError, YouTubeError, TranscriptionError, LLMError
+        except Busy as e:
+            self._error(409, str(e))
+        except NotFound as e:
+            self._error(404, str(e))
+        except RuntimeError as e:  # WebError, YouTubeError, TranscriptionError, LLMError, NotebookLMError
             self._error(400, str(e))
         except Exception as e:  # noqa: BLE001
             self._error(500, f"{type(e).__name__}: {e}")
@@ -379,6 +515,8 @@ HTML = r"""<!doctype html>
   h1 { font-size:18px; margin:0; font-weight:650; letter-spacing:.2px; }
   .pill { padding:2px 9px; border-radius:99px; background:var(--panel2); color:var(--muted); font-size:12px; }
   .spacer { flex:1; }
+  a.navlink { color:var(--accent); text-decoration:none; font-size:14px; }
+  a.navlink:hover { text-decoration:underline; }
   button { background:var(--panel2); color:var(--text); border:1px solid var(--line); border-radius:8px;
            padding:7px 12px; font:inherit; font-size:13px; cursor:pointer; }
   button:hover { border-color:var(--accent); }
@@ -432,6 +570,7 @@ HTML = r"""<!doctype html>
   <span class="pill" id="quota">квота: …</span>
   <span class="pill" id="cfg">…</span>
   <span class="spacer"></span>
+  <a class="navlink" href="/notebooks">Ноутбуки</a>
   <button class="ghost" id="toggle-log">Журнал</button>
   <button class="primary" id="scan">Сканувати inbox</button>
 </header>
@@ -569,6 +708,172 @@ document.getElementById("scan").onclick = async () => {
 document.getElementById("toggle-log").onclick = () => document.getElementById("log").classList.toggle("on");
 refresh();
 setInterval(refresh, 15000);
+</script>
+</body>
+</html>
+"""
+
+
+NOTEBOOKS_HTML = r"""<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ноутбуки · AudioTube Studio</title>
+<style>
+  :root { --bg:#101418; --panel:#171d24; --panel2:#1f2731; --text:#e8eef5; --muted:#93a4b5;
+          --accent:#4ea1ff; --ok:#41c98a; --warn:#ffb454; --err:#ff6b6b; --line:#2a3542; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { position:sticky; top:0; z-index:5; background:rgba(16,20,24,.96); border-bottom:1px solid var(--line);
+           padding:14px 22px; display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; font-weight:650; }
+  h2 { font-size:16px; margin:22px 0 10px; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .spacer { flex:1; }
+  main { padding:18px 22px 60px; max-width:1100px; margin:0 auto; }
+  button { background:var(--panel2); color:var(--text); border:1px solid var(--line); border-radius:8px;
+           padding:7px 12px; font:inherit; font-size:13px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:wait; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#06121f; font-weight:600; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px;
+           display:flex; gap:22px; flex-wrap:wrap; }
+  .stat .k { color:var(--muted); font-size:12px; }
+  .stat .v { font-size:17px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .table-wrap { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line);
+          border-radius:12px; overflow:hidden; }
+  th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); font-size:14px; }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  td.n { text-align:right; font-variant-numeric:tabular-nums; }
+  tr:last-child td { border-bottom:none; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--err); } .muted { color:var(--muted); }
+  .empty { color:var(--muted); padding:40px 0; text-align:center; }
+  #log { margin-top:18px; background:#0b0f13; border:1px solid var(--line); border-radius:10px;
+         font:12px/1.5 ui-monospace, monospace; padding:10px 14px; color:#a9bccd; white-space:pre-wrap; display:none; }
+  #log.on { display:block; }
+  @media (max-width:640px) { header, main { padding-left:16px; padding-right:16px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="/notebooks" style="color:inherit">Ноутбуки</a></h1>
+  <a href="/">← Черга задач</a>
+  <span class="spacer"></span>
+  <button id="sync-plan">Синк (план)</button>
+  <button class="primary" id="sync-run">Синк</button>
+</header>
+<main>
+  <div class="panel" id="daemon">Завантаження…</div>
+  <div id="content"><div class="empty">Завантаження…</div></div>
+  <div id="log"></div>
+</main>
+<script>
+const UA = {new:"нове", transcribed:"транскрипт", described:"метадані", rendered:"відрендерено",
+            uploaded:"на YouTube", done:"готово"};
+const parts = location.pathname.split("/").filter(Boolean);
+const nbId = parts.length > 1 ? decodeURIComponent(parts[1]) : null;
+
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function fmtDur(s) {
+  if (!s) return "—";
+  s = Math.round(s); const m = Math.floor(s/60), r = s%60;
+  return Math.floor(m/60) ? `${Math.floor(m/60)}:${String(m%60).padStart(2,'0')}:${String(r).padStart(2,'0')}`
+                          : `${m}:${String(r).padStart(2,'0')}`;
+}
+function fmtTime(iso) {
+  if (!iso) return "зараз";
+  const d = new Date(iso);
+  return d.toLocaleString("uk-UA", {day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit"});
+}
+async function api(path, opts = {}) {
+  const res = await fetch(path, {headers: {"Content-Type": "application/json"}, ...opts});
+  let data;
+  try { data = await res.json(); } catch { throw new Error(`HTTP ${res.status}`); }
+  if (!res.ok || data.ok === false) throw new Error(data.message || `HTTP ${res.status}`);
+  return data;
+}
+function setLog(lines) {
+  const el = document.getElementById("log");
+  el.classList.add("on");
+  el.textContent = lines.join("\n");
+}
+function stat(k, v, cls = "") { return `<div class="stat"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`; }
+
+async function loadDaemon() {
+  const el = document.getElementById("daemon");
+  try {
+    const d = await api("/api/daemon");
+    el.innerHTML =
+      stat("Демон", d.running ? "працює" : "не запущено", d.running ? "ok" : "muted") +
+      stat("Опубліковано сьогодні", `${d.uploads_today} / ${d.videos_per_day}`) +
+      stat("Квота YouTube", `${d.quota.remaining} / ${d.quota.limit}`, d.quota.remaining < 1700 ? "warn" : "") +
+      stat("Наступне вікно", esc(fmtTime(d.next_upload_at)));
+  } catch (e) { el.innerHTML = `<span class="bad">Помилка: ${esc(e.message)}</span>`; }
+}
+async function loadList() {
+  const data = await api("/api/notebooks");
+  if (!data.notebooks.length)
+    return `<div class="empty">Ще немає ноутбуків. Натисніть «Синк (план)», щоб побачити, що є в NotebookLM.</div>`;
+  const rows = data.notebooks.map(n => `<tr>
+      <td><a href="/notebooks/${encodeURIComponent(n.id)}">${esc(n.title)}</a></td>
+      <td class="n">${n.downloaded}</td>
+      <td class="n">${n.queued}</td>
+      <td class="n ok">${n.published}</td>
+      <td class="n ${n.errors ? "bad" : ""}">${n.errors}</td>
+      <td class="n ${n.missing ? "warn" : ""}">${n.missing}</td>
+      <td class="muted">${esc((n.synced_at || "").slice(0, 16).replace("T", " "))}</td>
+    </tr>`).join("");
+  return `<h2>Ноутбуки NotebookLM</h2><div class="table-wrap"><table>
+    <tr><th>Ноутбук</th><th>Скачано</th><th>У черзі</th><th>Опубліковано</th><th>Помилки</th><th>Зникли</th><th>Синк</th></tr>
+    ${rows}</table></div>`;
+}
+async function loadOne(id) {
+  const data = await api(`/api/notebooks/${encodeURIComponent(id)}`);
+  const nb = data.notebook;
+  const link = nb.url ? ` · <a href="${esc(nb.url)}" target="_blank">відкрити в NotebookLM</a>` : "";
+  if (!data.items.length) return `<h2>${esc(nb.title)}${link}</h2><div class="empty">Переказів ще немає.</div>`;
+  const rows = data.items.map(i => {
+    const status = i.job_status ? (UA[i.job_status] || i.job_status) : "без задачі";
+    const state = i.state === "missing" ? `<span class="warn">зник з NotebookLM</span>` : "";
+    const yt = i.url ? `<a href="${esc(i.url)}" target="_blank">${esc(i.url.replace("https://", ""))}</a>` : "—";
+    return `<tr>
+      <td>${esc(i.title)}<div class="muted" style="font-size:12px">${esc((i.created_at || "").slice(0, 10))} ${state}</div></td>
+      <td class="n">${fmtDur(i.duration)}</td>
+      <td>${esc(status)}${i.job_id ? ` <span class="muted">#${i.job_id}</span>` : ""}</td>
+      <td>${yt}</td>
+      <td class="bad">${esc(i.error || "")}</td>
+    </tr>`;
+  }).join("");
+  return `<h2>${esc(nb.title)}${link}</h2><div class="table-wrap"><table>
+    <tr><th>Переказ</th><th>Тривалість</th><th>Задача</th><th>YouTube</th><th>Помилка</th></tr>
+    ${rows}</table></div>`;
+}
+async function refresh() {
+  loadDaemon();
+  const box = document.getElementById("content");
+  try { box.innerHTML = nbId ? await loadOne(nbId) : await loadList(); }
+  catch (e) { box.innerHTML = `<div class="empty bad">Помилка: ${esc(e.message)}</div>`; }
+}
+async function runSync(dryRun) {
+  const buttons = [document.getElementById("sync-plan"), document.getElementById("sync-run")];
+  buttons.forEach(b => b.disabled = true);
+  setLog([dryRun ? "будую план синку…" : "синхронізую з NotebookLM…"]);
+  try {
+    const data = await api(`/api/sync${dryRun ? "?dry_run=1" : ""}`, {method: "POST"});
+    const items = data.report.items.map(i => `${i.action.padEnd(9)} ${i.notebook} — ${i.title}${i.message ? " (" + i.message + ")" : ""}`);
+    setLog([data.message, ...items, ...data.report.errors.map(e => "помилка: " + e)]);
+  } catch (e) { setLog([`Помилка: ${e.message}`]); }
+  finally { buttons.forEach(b => b.disabled = false); refresh(); }
+}
+document.getElementById("sync-plan").onclick = () => runSync(true);
+document.getElementById("sync-run").onclick = () => {
+  if (confirm("Запустити справжній синк? Нові перекази буде скачано (не більше max_per_run).")) runSync(false);
+};
+refresh();
+setInterval(loadDaemon, 30000);
 </script>
 </body>
 </html>

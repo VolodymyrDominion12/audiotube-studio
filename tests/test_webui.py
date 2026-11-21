@@ -6,8 +6,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from datetime import datetime, timedelta
+
 from audiotube.config import load_config
+from audiotube.daemon import FileLock
+from audiotube.db import Database
+from audiotube.notebooklm import RemoteNotebook
 from audiotube.webui import WebApp, make_server
+from test_sync import FakeAdapter, artifact
 
 
 class WebUITests(unittest.TestCase):
@@ -133,6 +139,210 @@ class WebUITests(unittest.TestCase):
         work.mkdir(parents=True)
         (work / "plan.json").write_text("{}", encoding="utf-8")
         self.assertIsNotNone(self.app.media_path("workspace/x/plan.json"))
+
+
+class NotebooksWebTests(unittest.TestCase):
+    """Вкладка «Ноутбуки» (spec 008): БД засіяна вручну, NotebookLM — FakeAdapter."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "config.yaml").write_text(
+            "notebooklm:\n  delay_seconds: 0\n  max_per_run: 20\n"
+            "daemon:\n  videos_per_day: 2\n  min_hours_between: 6\n",
+            encoding="utf-8",
+        )
+        self.cfg = load_config(root=self.tmp)
+        self.cfg.ensure_dirs()
+        self.nb = RemoteNotebook(id="nb1abc123456", title="Docker за 20 хвилин")
+        self.adapter = FakeAdapter([self.nb], {self.nb.id: [artifact()]})
+
+        self.app = WebApp(self.cfg, "127.0.0.1", 0, adapter=self.adapter)
+        self.server = make_server(self.app)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    request = WebUITests.request
+
+    def get_json(self, path, expect=200):
+        status, body, _ = self.request(path)
+        self.assertEqual(status, expect, body)
+        return json.loads(body)
+
+    # --- засів БД -------------------------------------------------------------
+    def seed(self):
+        """nb-a: опубліковано, помилка, без задачі, зниклий; nb-b: один у черзі; nb-c: порожній."""
+        db = Database(self.cfg.db_path)
+        try:
+            db.save_notebook("nb-a", "Альфа", "alfa", None, 3)
+            db.save_notebook("nb-b", "Бета", "beta", None, 1)
+            db.save_notebook("nb-c", "Гама", "gama", None, 0)
+
+            def art(aid, nb, day, state="downloaded", job=None):
+                path = self.cfg.inbox / nb / f"{aid}.m4a"
+                db.save_artifact(
+                    artifact_id=aid, notebook_id=nb, title=f"Переказ {aid}",
+                    created_at=f"2026-10-0{day}T00:00:00+00:00", duration=600.0 + day,
+                    path=path, sha256=None, size=10, state=state,
+                )
+                if job:
+                    j = db.add_job(path, f"slug-{aid}", f"Переказ {aid}")
+                    db.link_artifact_job(aid, j.id)
+                    if job != "queued":
+                        db.update(j.id, **job)
+
+            art("a1", "nb-a", 1, job={"status": "done", "video_id": "VID1"})
+            art("a2", "nb-a", 2, job={"error": "квота вичерпана\nдеталі трасування"})
+            art("a3", "nb-a", 3)
+            art("a4", "nb-a", 4, state="missing", job="queued")
+            art("b1", "nb-b", 1, job="queued")
+        finally:
+            db.close()
+
+    def dump(self):
+        db = Database(self.cfg.db_path)
+        try:
+            return list(db.conn.iterdump())
+        finally:
+            db.close()
+
+    # --- тести ----------------------------------------------------------------
+    def test_notebooks_counters(self):
+        """WEB-AC1: GET /api/notebooks — усі ноутбуки з правильними лічильниками."""
+        self.seed()
+        data = self.get_json("/api/notebooks")
+        by_id = {n["id"]: n for n in data["notebooks"]}
+        self.assertEqual(list(by_id), ["nb-a", "nb-b", "nb-c"])  # за назвою
+        self.assertEqual(
+            {k: by_id["nb-a"][k] for k in ("downloaded", "missing", "published", "errors", "queued")},
+            {"downloaded": 4, "missing": 1, "published": 1, "errors": 1, "queued": 2},
+        )
+        self.assertEqual(
+            {k: by_id["nb-b"][k] for k in ("downloaded", "missing", "published", "errors", "queued")},
+            {"downloaded": 1, "missing": 0, "published": 0, "errors": 0, "queued": 1},
+        )
+        self.assertEqual(by_id["nb-c"]["downloaded"], 0)
+        self.assertEqual(by_id["nb-c"]["queued"], 0)
+        self.assertEqual(by_id["nb-a"]["title"], "Альфа")
+
+    def test_notebook_detail(self):
+        """WEB-AC5: перекази ноутбука зі статусом, URL і першим рядком помилки; невідомий id → 404."""
+        self.seed()
+        data = self.get_json("/api/notebooks/nb-a")
+        self.assertEqual(data["notebook"]["title"], "Альфа")
+        items = {i["id"]: i for i in data["items"]}
+        self.assertEqual(list(items), ["a1", "a2", "a3", "a4"])
+        self.assertEqual(items["a1"]["job_status"], "done")
+        self.assertEqual(items["a1"]["url"], "https://youtu.be/VID1")
+        self.assertEqual(items["a2"]["error"], "квота вичерпана")
+        self.assertIsNone(items["a3"]["job_id"])
+        self.assertIsNone(items["a3"]["url"])
+        self.assertEqual(items["a4"]["state"], "missing")
+        self.assertEqual(items["a1"]["duration"], 601.0)
+
+        status, body, _ = self.request("/api/notebooks/nope")
+        self.assertEqual(status, 404)
+        self.assertIn("не знайдено", json.loads(body)["message"])
+
+    def test_daemon_panel(self):
+        """WEB-AC6: 1 публікація сьогодні з 2 → наступне вікно = остання + min_hours_between."""
+        db = Database(self.cfg.db_path)
+        try:
+            db.record_upload(1, "VID1")
+            last = db.last_upload_at()
+        finally:
+            db.close()
+        data = self.get_json("/api/daemon")
+        self.assertEqual(data["uploads_today"], 1)
+        self.assertEqual(data["videos_per_day"], 2)
+        self.assertEqual(data["quota"]["limit"], self.cfg.youtube.daily_quota)
+        self.assertEqual(data["quota"]["remaining"], self.cfg.youtube.daily_quota)
+        self.assertEqual(datetime.fromisoformat(data["next_upload_at"]), last + timedelta(hours=6))
+        self.assertFalse(data["running"])
+
+        lock = FileLock(self.cfg.data / "daemon.lock")
+        self.assertTrue(lock.acquire())
+        try:
+            self.assertTrue(self.get_json("/api/daemon")["running"])
+        finally:
+            lock.release()
+
+    def test_sync_plan_does_not_change_db(self):
+        """WEB-AC2: POST синк-план показує план і не змінює БД та inbox."""
+        self.seed()
+        before = self.dump()
+        status, body, _ = self.request("/api/sync?dry_run=1", method="POST", data={})
+        self.assertEqual(status, 200, body)
+        data = json.loads(body)
+        self.assertTrue(data["dry_run"])
+        self.assertEqual(data["report"]["planned"], 1)
+        actions = [i["action"] for i in data["report"]["items"]]
+        self.assertEqual(actions.count("plan"), 1)
+        # засіяних ноутбуків немає в NotebookLM → план показує 4 зниклі, але в БД їх не позначає
+        self.assertEqual(data["report"]["missing"], 4)
+        self.assertEqual(self.dump(), before)
+        self.assertEqual(self.adapter.downloads, [])
+
+    def test_sync_busy_lock_returns_409(self):
+        """WEB-AC3: замок демона зайнятий → 409 і повідомлення, NotebookLM не чіпаємо."""
+        lock = FileLock(self.cfg.data / "daemon.lock")
+        self.assertTrue(lock.acquire())
+        try:
+            status, body, _ = self.request("/api/sync", method="POST", data={})
+        finally:
+            lock.release()
+        self.assertEqual(status, 409)
+        self.assertIn("демон", json.loads(body)["message"])
+        self.assertEqual(self.adapter.entered, 0)
+
+    def test_sync_runs_and_releases_lock(self):
+        """WEB-AC7: справжній синк качає файл, реєструє задачу й звільняє замок."""
+        status, body, _ = self.request("/api/sync", method="POST", data={})
+        self.assertEqual(status, 200, body)
+        data = json.loads(body)
+        self.assertFalse(data["dry_run"])
+        self.assertEqual(data["report"]["downloaded"], 1)
+        self.assertEqual(len(self.adapter.downloads), 1)
+
+        nbs = self.get_json("/api/notebooks")["notebooks"]
+        self.assertEqual(len(nbs), 1)
+        self.assertEqual(nbs[0]["downloaded"], 1)
+        self.assertEqual(nbs[0]["queued"], 1)
+        self.assertEqual(len(self.get_json("/api/state")["jobs"]), 1)
+
+        lock = FileLock(self.cfg.data / "daemon.lock")
+        self.assertTrue(lock.acquire(), "замок мав бути звільнений після синку")
+        lock.release()
+
+    def test_get_requests_do_not_change_db(self):
+        """WEB-AC4: жоден GET (сторінки й API) не змінює БД."""
+        self.seed()
+        before = self.dump()
+        for path in ("/", "/notebooks", "/notebooks/nb-a", "/api/state", "/api/notebooks",
+                     "/api/notebooks/nb-a", "/api/daemon"):
+            status, _, _ = self.request(path)
+            self.assertEqual(status, 200, path)
+        status, _, _ = self.request("/api/sync")
+        self.assertEqual(status, 404)  # синк лише через POST
+        self.assertEqual(self.dump(), before)
+        self.assertEqual(self.adapter.entered, 0)
+
+    def test_notebooks_page_served(self):
+        """WEB-R1: сторінка /notebooks віддає HTML, головна має на неї посилання."""
+        status, body, headers = self.request("/notebooks")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["Content-Type"])
+        self.assertIn("Ноутбуки", body.decode("utf-8"))
+        _, body, _ = self.request("/")
+        self.assertIn('href="/notebooks"', body.decode("utf-8"))
 
 
 if __name__ == "__main__":

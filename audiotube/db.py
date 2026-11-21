@@ -136,6 +136,12 @@ class Database:
                 self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {sql_type}")
         self.conn.commit()
 
+    def __enter__(self) -> "Database":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
     def close(self) -> None:
         self.conn.close()
 
@@ -254,6 +260,36 @@ class Database:
     def link_artifact_job(self, artifact_id: str, job_id: int) -> None:
         self.conn.execute("UPDATE artifacts SET job_id=? WHERE id=?", (job_id, artifact_id))
         self.conn.commit()
+
+    # --- зведення для веб-UI (spec 008) -------------------------------------
+    def notebook_stats(self) -> list[sqlite3.Row]:
+        """Ноутбуки з лічильниками переказів; визначення лічильників — spec 008 §5."""
+        return self.conn.execute(
+            """SELECT n.id, n.title, n.slug, n.url, n.sources, n.synced_at,
+                      COUNT(a.id) AS downloaded,
+                      COALESCE(SUM(a.state = 'missing'), 0) AS missing,
+                      COALESCE(SUM(j.video_id IS NOT NULL), 0) AS published,
+                      COALESCE(SUM(j.video_id IS NULL AND j.error IS NOT NULL), 0) AS errors,
+                      COALESCE(SUM(a.id IS NOT NULL AND j.video_id IS NULL AND j.error IS NULL), 0)
+                          AS queued
+               FROM notebooks n
+               LEFT JOIN artifacts a ON a.notebook_id = n.id
+               LEFT JOIN jobs j ON j.id = a.job_id
+               GROUP BY n.id
+               ORDER BY n.title"""
+        ).fetchall()
+
+    def notebook_items(self, notebook_id: str) -> list[sqlite3.Row]:
+        """Перекази ноутбука разом зі станом прив'язаної задачі (якщо є)."""
+        return self.conn.execute(
+            """SELECT a.id, a.title, a.created_at, a.duration, a.state, a.path, a.job_id,
+                      j.status AS job_status, j.video_id, j.error, j.attempts
+               FROM artifacts a
+               LEFT JOIN jobs j ON j.id = a.job_id
+               WHERE a.notebook_id = ?
+               ORDER BY a.created_at, a.id""",
+            (notebook_id,),
+        ).fetchall()
 
     # --- невдалі спроби -----------------------------------------------------
     def bump_attempt(self, job_id: int) -> int:

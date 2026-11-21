@@ -67,6 +67,45 @@ class FileLock:
         self._fh.close()
         self._fh = None
 
+    def is_locked(self) -> bool:
+        """Чи тримає замок хтось інший. Файл не створює, якщо його ще немає."""
+        if not self.path.exists():
+            return False
+        if self._fh is not None:
+            return True
+        probe = FileLock(self.path)
+        if not probe.acquire():
+            return True
+        probe.release()
+        return False
+
+    def __enter__(self) -> "FileLock":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.release()
+
+
+def daemon_lock(cfg: Config) -> FileLock:
+    """Єдиний замок для циклу демона і синку з веб-UI (spec 008 §9)."""
+    return FileLock(cfg.data / "daemon.lock")
+
+
+def next_upload_at(cfg: Config, db) -> datetime | None:
+    """Коли демон наступного разу має право публікувати; None — вже зараз.
+
+    Денний бюджет вичерпано → початок завтрашнього дня (локальний час).
+    """
+    today = db.uploads_count()
+    if today >= cfg.daemon.videos_per_day:
+        now = datetime.now().astimezone()
+        return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    last = db.last_upload_at()
+    if last is None or today == 0:
+        return None
+    nxt = last + timedelta(hours=cfg.daemon.min_hours_between)
+    return nxt if nxt > datetime.now(last.tzinfo) else None
+
 
 @dataclass
 class CycleStats:
@@ -121,7 +160,7 @@ class Daemon:
             self._close()
             return 2
 
-        lock = FileLock(self.cfg.data / "daemon.lock")
+        lock = daemon_lock(self.cfg)
         if not dry_run and not lock.acquire():
             self.log("демон уже працює (файл-лок зайнятий) — вихід")
             self._close()
