@@ -25,7 +25,7 @@
 | DMN-R4 | Задача береться, лише якщо квоти вистачає на `upload_cost` + обкладинка (+ `captions_cost`, якщо `upload_captions`; + плейлист, якщо `manage_playlists`) з урахуванням `quota_reserve`. |
 | DMN-R5 | Порядок черги: `oldest` (FIFO) або `newest`. |
 | DMN-R6 | Невдача → `attempts + 1`; задачі з `attempts >= max_attempts` не беруться. |
-| DMN-R7 | Після успіху: опційно видалити `.mp4` (`cleanup_video_after_upload`), опційно `notify-send`. |
+| DMN-R7 | Після успіху: опційно видалити `.mp4` (`cleanup_video_after_upload`), опційно сповіщення (див. [007](../007-telegram-notify/spec.md)). |
 | DMN-R8 | Другий екземпляр не стартує (`flock` на `data/daemon.lock`, exit 3). |
 | DMN-R9 | `SIGTERM` зупиняє після поточного кроку. |
 | DMN-R10 | `--dry-run` нічого не змінює; `--once` — один цикл. |

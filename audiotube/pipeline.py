@@ -227,6 +227,12 @@ class Pipeline:
             )
         return self._publisher
 
+    def check_publish_auth(self) -> None:
+        """Перевіряє токен YouTube без браузера; протух → youtube.AuthRequired (spec 007, NTF-R7)."""
+        from audiotube.youtube import get_credentials
+
+        get_credentials(self.cfg, interactive=False)
+
     def publish(self, job: Job) -> Job:
         from audiotube.youtube import QuotaExceeded
 

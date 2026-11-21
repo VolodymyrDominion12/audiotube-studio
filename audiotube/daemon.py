@@ -5,15 +5,15 @@
 - тримає денний бюджет відео і мінімальний інтервал між публікаціями;
 - не виходить за квоту YouTube (перевіряє залишок до кожного відео);
 - після 3 невдач (налаштовується) перестає чіпати задачу;
-- за бажанням видаляє .mp4 після успішної публікації, лишаючи аудіо й субтитри.
+- за бажанням видаляє .mp4 після успішної публікації, лишаючи аудіо й субтитри;
+- надсилає сповіщення (desktop/Telegram, spec 007): публікація, остаточна невдача,
+  протухла авторизація, денне зведення.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
 import signal
-import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -22,9 +22,11 @@ from pathlib import Path
 from audiotube.config import Config
 from audiotube.db import Job
 from audiotube.media import has_ffmpeg
-from audiotube.notebooklm import NotebookLMError
+from audiotube.notebooklm import NotebookLMError, NotebookLMUnavailable
+from audiotube.notify import Notifier, build_notifier
 from audiotube.pipeline import STATUS_ORDER, Pipeline
 from audiotube.sync import SyncService
+from audiotube.youtube import AuthRequired
 
 COST_THUMBNAIL = 50
 COST_PLAYLIST = 52
@@ -129,11 +131,18 @@ def estimate_upload_cost(cfg: Config) -> int:
 
 
 class Daemon:
-    def __init__(self, cfg: Config, pipe: Pipeline | None = None, log=print):
+    def __init__(
+        self,
+        cfg: Config,
+        pipe: Pipeline | None = None,
+        log=print,
+        notifier: Notifier | None = None,
+    ):
         self.cfg = cfg
         self._owns_pipe = pipe is None
         self.pipe = pipe or Pipeline(cfg, log=log)
         self.log = log
+        self.notifier = notifier or build_notifier(cfg, self.pipe.db, log)
         self._stop = False
 
     # --- життєвий цикл ------------------------------------------------------
@@ -183,6 +192,14 @@ class Daemon:
     def _cycle(
         self, *, dry_run: bool, max_videos: int | None, sync: bool | None
     ) -> CycleStats:
+        stats = self._cycle_body(dry_run=dry_run, max_videos=max_videos, sync=sync)
+        if not dry_run:
+            self.notifier.daily_summary()
+        return stats
+
+    def _cycle_body(
+        self, *, dry_run: bool, max_videos: int | None, sync: bool | None
+    ) -> CycleStats:
         cfg = self.cfg
         stats = CycleStats()
 
@@ -195,6 +212,8 @@ class Daemon:
                     self.log(f"синк: {len(report.errors)} помилок (див. audiotube sync)")
             except NotebookLMError as e:
                 self.log(f"синк пропущено: {e}")
+                if not dry_run and not isinstance(e, NotebookLMUnavailable):
+                    self.notifier.auth_expired("notebooklm", str(e))
             if not dry_run:
                 self.pipe.scan()
 
@@ -233,6 +252,18 @@ class Daemon:
             stats.reason = "немає задач у черзі"
             return stats
 
+        if not dry_run:
+            # NTF-R7: протухлий токен не має «спалювати» спроби кожної задачі
+            try:
+                self.pipe.check_publish_auth()
+            except AuthRequired as e:
+                self.log(f"публікацію пропущено: {e}")
+                self.notifier.auth_expired("youtube", str(e))
+                stats.reason = "YouTube: потрібна повторна авторизація (audiotube auth)"
+                return stats
+            except Exception as e:  # noqa: BLE001 — інші збої обробить publish() задачі
+                self.log(f"перевірка токена YouTube не вдалася: {e}")
+
         for job in jobs:
             if self._stop or remaining <= 0:
                 break
@@ -264,6 +295,8 @@ class Daemon:
                 attempts = self.pipe.db.bump_attempt(job.id)
                 first = (job.error or "невідома помилка").splitlines()[0]
                 self.log(f"[{job.id}] не вдалося (спроба {attempts}): {first}")
+                if attempts == cfg.daemon.max_attempts:
+                    self.notifier.failed_final(job, attempts)
         return stats
 
     def _advance(self, job: Job) -> Job:
@@ -288,8 +321,7 @@ class Daemon:
     def _after_publish(self, job: Job) -> None:
         self.log(f"[{job.id}] опубліковано: {job.url or job.video_id}")
         self._report(job)
-        if self.cfg.daemon.notify:
-            self._notify(f"Опубліковано: {job.title or job.audio.name}")
+        self.notifier.published(job)
         if self.cfg.daemon.cleanup_video_after_upload:
             self._cleanup_video(job)
 
@@ -316,16 +348,6 @@ class Daemon:
         }
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
-
-    @staticmethod
-    def _notify(text: str) -> None:
-        exe = shutil.which("notify-send")
-        if not exe:
-            return
-        try:
-            subprocess.run([exe, "AudioTube", text], timeout=10, capture_output=True)
-        except (OSError, subprocess.SubprocessError):
-            pass
 
     # --- службове -----------------------------------------------------------
     def _install_signals(self) -> None:

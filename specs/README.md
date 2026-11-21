@@ -46,7 +46,7 @@ draft → approved → in-progress → implemented
 | 004 | [Демон публікацій («Видавець»)](004-publish-daemon/spec.md) | implemented | `daemon.py`, `deploy/systemd/` |
 | 005 | [Версії й зникнення артефактів](005-artifact-lifecycle/spec.md) | implemented | `sync.py`, `db.py` |
 | 006 | [Ноутбук → плейлист](006-notebook-playlists/spec.md) | draft (відкладено) | `youtube.py`, `sync.py` |
-| 007 | [Сповіщення в Telegram](007-telegram-notify/spec.md) | draft | `daemon.py` |
+| 007 | [Сповіщення в Telegram](007-telegram-notify/spec.md) | implemented | `notify.py`, `daemon.py` |
 | 008 | [Вкладка «Ноутбуки» у веб-UI](008-webui-notebooks/spec.md) | implemented | `webui.py`, `db.py` |
 
 Спеки 001–004 написані **після** коду (reverse-engineered): вони фіксують поточну поведінку

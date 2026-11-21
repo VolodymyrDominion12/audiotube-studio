@@ -114,7 +114,9 @@ audiotube daemon                  # безперервно: sync → ренде�
 
 Демон тримає денний бюджет (`videos_per_day`, типово 2), мінімальний інтервал між відео,
 не виходить за квоту YouTube, після 3 невдач заморожує задачу й бере файловий лок, щоб два
-екземпляри не дублювали завантаження. Готові systemd-юніти — у `deploy/systemd/`, інструкції —
+екземпляри не дублювали завантаження. Може надсилати сповіщення в Telegram (публікації, заморожені
+задачі, протухла авторизація, денне зведення): `daemon.notify: telegram` + `TELEGRAM_BOT_TOKEN` і
+`TELEGRAM_CHAT_ID` у `.env`, перевірка — `audiotube notify --test`. Готові systemd-юніти — у `deploy/systemd/`, інструкції —
 [docs/06_AUTOMATION.md](docs/06_AUTOMATION.md).
 
 ## NotebookLM
@@ -263,8 +265,9 @@ audiotube/
   notebooklm.py  адаптер до NotebookLM (неофіційний клієнт)
   sync.py        синхронізація ноутбуків -> inbox/<ноутбук>/
   daemon.py      автоматичний цикл: бюджет, повтори, лок, очищення
+  notify.py      сповіщення демона: Telegram / notify-send
   db.py          SQLite (data/audiotube.db)
-tests/           113 тестів; синк, демон і публікація — без мережі й FFmpeg
+tests/           145 тестів; синк, демон і публікація — без мережі й FFmpeg
 deploy/systemd/  готові unit-файли для автозапуску
 docs/            концепція, аудит, інструкції
 ```

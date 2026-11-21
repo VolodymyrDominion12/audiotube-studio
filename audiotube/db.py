@@ -68,6 +68,11 @@ CREATE TABLE IF NOT EXISTS uploads (
     at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_uploads_day ON uploads(day);
+-- коли востаннє надсилали сповіщення певного типу (spec 007: обмеження частоти)
+CREATE TABLE IF NOT EXISTS notifications (
+    key TEXT PRIMARY KEY,
+    sent_at TEXT NOT NULL
+);
 """
 
 # колонки, додані після 0.1 — для баз, створених старішою версією
@@ -317,6 +322,38 @@ class Database:
     def last_upload_at(self) -> datetime | None:
         row = self.conn.execute("SELECT at FROM uploads ORDER BY id DESC LIMIT 1").fetchone()
         return datetime.fromisoformat(row["at"]) if row else None
+
+    # --- сповіщення (spec 007) ------------------------------------------------
+    def last_notified(self, key: str) -> datetime | None:
+        row = self.conn.execute("SELECT sent_at FROM notifications WHERE key=?", (key,)).fetchone()
+        return datetime.fromisoformat(row["sent_at"]) if row else None
+
+    def mark_notified(self, key: str, at: datetime | None = None) -> None:
+        at = at or datetime.now(timezone.utc)
+        self.conn.execute(
+            """INSERT INTO notifications (key, sent_at) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET sent_at=excluded.sent_at""",
+            (key, at.isoformat(timespec="seconds")),
+        )
+        self.conn.commit()
+
+    def daily_counts(self, max_attempts: int) -> dict[str, int]:
+        """Лічильники для денного зведення: скачано й опубліковано сьогодні, черга, помилки."""
+        local_midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        since = local_midnight.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+        def one(sql: str, *args) -> int:
+            row = self.conn.execute(sql, args).fetchone()
+            return int(row[0] or 0)
+
+        return {
+            "downloaded": one("SELECT COUNT(*) FROM artifacts WHERE downloaded_at >= ?", since),
+            "published": self.uploads_count(),
+            "queued": one(
+                "SELECT COUNT(*) FROM jobs WHERE status != 'done' AND attempts < ?", max_attempts
+            ),
+            "errors": one("SELECT COUNT(*) FROM jobs WHERE error IS NOT NULL"),
+        }
 
 
 class QuotaTracker:

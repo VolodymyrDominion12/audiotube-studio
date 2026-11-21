@@ -77,7 +77,8 @@ daemon:
   sync_before_run: true     # спершу забирати нове з NotebookLM
   pause_seconds: 10         # пауза між відео в одному циклі
   cleanup_video_after_upload: true   # видаляти .mp4 після успішної публікації
-  notify: false             # notify-send, якщо є в системі
+  notify: false             # false | desktop (notify-send) | telegram — токен лише з env, див. docs/06
+  summary_hour: 21          # о котрій (не раніше) слати денне зведення; null = не слати
   quota_reserve: 0          # скільки одиниць квоти лишати недоторканими
 
 notebooklm:

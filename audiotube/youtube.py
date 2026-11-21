@@ -33,6 +33,10 @@ class QuotaExceeded(YouTubeError):
     pass
 
 
+class AuthRequired(YouTubeError):
+    """Немає дійсного токена, а інтерактивна авторизація заборонена (демон)."""
+
+
 def get_credentials(cfg: Config, interactive: bool = True):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
@@ -52,7 +56,7 @@ def get_credentials(cfg: Config, interactive: bool = True):
             creds = None
     if not creds or not creds.valid:
         if not interactive:
-            raise YouTubeError("немає дійсного токена YouTube. Виконайте: audiotube auth")
+            raise AuthRequired("немає дійсного токена YouTube. Виконайте: audiotube auth")
         if not secret_path.exists():
             raise YouTubeError(
                 f"не знайдено {secret_path}. Створіть OAuth-клієнт типу «Desktop app» у Google Cloud Console "

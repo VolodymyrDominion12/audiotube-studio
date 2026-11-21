@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class PathsCfg(BaseModel):
@@ -126,8 +126,19 @@ class DaemonCfg(BaseModel):
     sync_before_run: bool = True
     pause_seconds: float = Field(10, ge=0, le=600)
     cleanup_video_after_upload: bool = True
-    notify: bool = False
+    notify: Literal["none", "desktop", "telegram"] = "none"  # spec 007; true = desktop
+    summary_hour: int | None = Field(21, ge=0, le=23)  # денне зведення; null = вимкнено
     quota_reserve: int = Field(0, ge=0)
+
+    @field_validator("notify", mode="before")
+    @classmethod
+    def _notify_compat(cls, value):
+        """Сумісність зі старим `notify: true/false` (до spec 007)."""
+        if value is True:
+            return "desktop"
+        if value is False or value is None:
+            return "none"
+        return value
 
 
 class NotebookLMCfg(BaseModel):

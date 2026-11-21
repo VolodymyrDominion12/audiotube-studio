@@ -14,6 +14,7 @@
     audiotube run                      scan + transcribe + describe + render (+ upload)
     audiotube watch                    стежити за inbox/ і обробляти нові файли
     audiotube daemon                   автоматика: sync + рендер + публікація в межах квоти
+    audiotube notify --test            тестове сповіщення в Telegram
     audiotube status                   таблиця задач і квота
     audiotube playlists                плейлисти каналу
     audiotube reset <id> [--to new]    повернути задачу на попередній крок
@@ -432,6 +433,28 @@ def cmd_web(args) -> int:
     return serve(cfg, host=args.host, port=args.port, open_browser=args.open)
 
 
+def cmd_notify(args) -> int:
+    """NTF-R6: перевірити Telegram-бота до того, як вмикати `daemon.notify: telegram`."""
+    from audiotube.notify import ENV_CHAT, ENV_TOKEN, telegram_env, telegram_transport
+
+    if not args.test:
+        print("вкажіть --test, щоб надіслати тестове повідомлення")
+        return 2
+    cfg = _cfg(args)
+    text = f"🔔 AudioTube Studio: тестове сповіщення ({cfg.root.name}). Якщо ви це бачите — бот налаштований."
+    if args.dry_run:
+        print(f"[dry-run] буде надіслано в Telegram:\n{text}")
+        return 0
+    creds = telegram_env()
+    if creds is None:
+        print(f"не задано {ENV_TOKEN} і/або {ENV_CHAT} (у середовищі або .env) — див. docs/06_AUTOMATION.md")
+        return 1
+    if not telegram_transport(*creds, log=print)(text):
+        return 1
+    print(f"надіслано в чат {creds[1]}")
+    return 0
+
+
 def cmd_doctor(args) -> int:
     cfg = _cfg(args)
     problems = 0
@@ -503,6 +526,13 @@ def cmd_doctor(args) -> int:
     line(token.exists(), "YouTube токен", "є" if token.exists() else "запустіть audiotube auth")
     line(secret.exists(), "YouTube client_secret", "є" if secret.exists() else "див. docs/02_YOUTUBE_SETUP.md")
     if not token.exists() or not secret.exists():
+        problems += 1
+
+    from audiotube.notify import telegram_status
+
+    tg_ok, tg_note = telegram_status(cfg)
+    line(tg_ok, "Telegram-сповіщення", tg_note)
+    if tg_ok is False:
         problems += 1
 
     nvidia = shutil.which("nvidia-smi")
@@ -598,6 +628,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-sync", action="store_true", help="не звертатися до NotebookLM")
     s.add_argument("--max", type=int, help="не більше N відео за цикл")
     s.set_defaults(func=cmd_daemon)
+
+    s = sub.add_parser("notify", help="сповіщення: перевірка Telegram-бота")
+    s.add_argument("--test", action="store_true", help="надіслати тестове повідомлення")
+    s.add_argument("--dry-run", action="store_true", help="лише показати текст, нічого не надсилати")
+    s.set_defaults(func=cmd_notify)
 
     s = sub.add_parser("status", help="стан задач")
     s.add_argument("--missing", action="store_true", help="перекази, що зникли з NotebookLM")

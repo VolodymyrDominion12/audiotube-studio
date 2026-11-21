@@ -20,6 +20,11 @@ class FakePipe:
         self.quota = QuotaTracker(db, cfg.youtube.daily_quota)
         self.calls = []
         self.fail_publish = set()
+        self.auth_error = None  # youtube.AuthRequired, щоб імітувати протухлий токен
+
+    def check_publish_auth(self):
+        if self.auth_error:
+            raise self.auth_error
 
     def scan(self):
         self.calls.append("scan")
