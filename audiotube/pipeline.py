@@ -54,19 +54,41 @@ class Pipeline:
         self._publisher = None
 
     # --- реєстрація --------------------------------------------------------
+    def audio_files(self) -> list[Path]:
+        """Усі аудіо в inbox/, включно з підпапками ноутбуків.
+
+        Пропускаємо приховані теки, недокачані `.part` і робочі каталоги, якщо вони
+        випадково опинилися всередині inbox.
+        """
+        if not self.cfg.inbox.is_dir():
+            return []
+        skip = [self.cfg.workspace.resolve(), self.cfg.output.resolve(),
+                self.cfg.data.resolve(), self.cfg.cache.resolve()]
+        found = []
+        for f in sorted(self.cfg.inbox.rglob("*")):
+            if not f.is_file() or f.suffix.lower() not in AUDIO_EXTENSIONS:
+                continue
+            if f.name.endswith(".part"):
+                continue
+            rel = f.relative_to(self.cfg.inbox)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            resolved = f.resolve()
+            if any(resolved == s or s in resolved.parents for s in skip):
+                continue
+            found.append(f)
+        return found
+
     def scan(self) -> list[Job]:
         added = []
-        if not self.cfg.inbox.is_dir():
-            return added
-        for f in sorted(self.cfg.inbox.iterdir()):
-            if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS:
-                try:
-                    title = load_meta(f).title
-                except MetadataError:
-                    title = title_from_filename(f)  # помилку покаже рендер
-                job = self.db.add_job(f, slugify(title), title=title)
-                if job:
-                    added.append(job)
+        for f in self.audio_files():
+            try:
+                title = load_meta(f).title
+            except MetadataError:
+                title = title_from_filename(f)  # помилку покаже рендер
+            job = self.db.add_job(f, slugify(title), title=title)
+            if job:
+                added.append(job)
         return added
 
     # --- транскрипція ------------------------------------------------------
@@ -221,6 +243,7 @@ class Pipeline:
                 self.log(f"[{job.id}] завантаження на YouTube: «{meta.title}»")
                 vid = self.publisher.upload(job.video, meta)
                 job = self.db.update(job.id, video_id=vid, status="uploaded", error=None)
+                self.db.record_upload(job.id, vid)  # денний бюджет демона
                 self.log(f"[{job.id}] завантажено: {job.url}")
                 if job.thumbnail and job.thumbnail.exists():
                     self.publisher.set_thumbnail(vid, job.thumbnail)
@@ -232,7 +255,7 @@ class Pipeline:
                         job = self.db.update(job.id, captions_id=cid)
                         self.log(f"[{job.id}] субтитри додано ({subtitles.name})")
 
-            if meta.playlist and not job.playlist_id:
+            if self.cfg.youtube.manage_playlists and meta.playlist and not job.playlist_id:
                 pid = self.publisher.ensure_playlist(meta.playlist)
                 self.publisher.add_to_playlist(pid, job.video_id)
                 job = self.db.update(job.id, playlist_id=pid)

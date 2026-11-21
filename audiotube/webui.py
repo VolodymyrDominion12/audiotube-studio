@@ -135,7 +135,7 @@ class WebApp:
                 elif action == "upload":
                     job = pipe.publish(job)
                 elif action == "reset":
-                    job = pipe.db.update(job.id, status="new", error=None)
+                    job = pipe.db.update(job.id, status="new", error=None, attempts=0)
                 else:
                     raise WebError(f"невідома дія: {action}")
                 payload = {"job": job_json(self.cfg, job)}

@@ -1,6 +1,8 @@
 """Командний рядок AudioTube Studio.
 
     audiotube init                     створити папки і config.yaml
+    audiotube sync                     завантажити аудіо з NotebookLM у inbox/<ноутбук>/
+    audiotube import <шлях>            додати вже завантажені вручну аудіо
     audiotube meta <аудіо>             створити шаблон метаданих поруч з аудіо
     audiotube scan                     зареєструвати нові аудіо з inbox/
     audiotube transcribe [id ...]      транскрипція -> transcript.json + subtitles.srt
@@ -11,6 +13,7 @@
     audiotube captions <id>            додати субтитри до вже завантаженого відео
     audiotube run                      scan + transcribe + describe + render (+ upload)
     audiotube watch                    стежити за inbox/ і обробляти нові файли
+    audiotube daemon                   автоматика: sync + рендер + публікація в межах квоти
     audiotube status                   таблиця задач і квота
     audiotube playlists                плейлисти каналу
     audiotube reset <id> [--to new]    повернути задачу на попередній крок
@@ -29,10 +32,13 @@ from pathlib import Path
 
 from audiotube import __version__
 from audiotube.config import Config, load_config
-from audiotube.db import STATUSES
+from audiotube.daemon import Daemon
+from audiotube.db import STATUSES, Database
 from audiotube.media import FFmpegError, ffprobe_bin, fmt_time, require_ffmpeg
 from audiotube.metadata import write_sidecar_template
+from audiotube.notebooklm import NotebookLMError
 from audiotube.pipeline import STATUS_ORDER, Pipeline, resolve_audio_arg
+from audiotube.sync import SyncService, build_adapter, import_audio
 
 STATUS_UA = {
     "new": "нове",
@@ -75,6 +81,73 @@ def cmd_meta(args) -> int:
         side = write_sidecar_template(resolve_audio_arg(cfg, a), cfg, overwrite=args.overwrite)
         print(f"метадані: {side}")
     return 0
+
+
+def cmd_sync(args) -> int:
+    cfg = _cfg(args)
+    cfg.ensure_dirs()
+    db = Database(cfg.db_path)
+    service = SyncService(cfg, db=db, adapter=build_adapter(cfg))
+    try:
+        report = service.run(
+            dry_run=args.dry_run,
+            notebook=args.notebook,
+            limit=args.limit,
+            force=args.force,
+        )
+    except NotebookLMError as e:
+        print(f"NotebookLM: {e}", file=sys.stderr)
+        return 2
+    finally:
+        db.close()
+
+    for item in report.items:
+        if item.action in {"plan", "download", "repair"}:
+            mark = "~" if item.action == "plan" else "+"
+            name = item.path.name if item.path else item.title
+            print(f" {mark} [{item.notebook}] {name}")
+    for err in report.errors:
+        print(f" ! {err}", file=sys.stderr)
+
+    prefix = "заплановано" if args.dry_run else "завантажено"
+    print(
+        f"ноутбуків: {report.notebooks}, {prefix}: {report.total_new}, "
+        f"пропущено: {report.skipped}, помилок: {len(report.errors)}"
+    )
+    print(f"тека: {cfg.inbox}")
+    return 0 if not report.errors else 1
+
+
+def cmd_import(args) -> int:
+    cfg = _cfg(args)
+    cfg.ensure_dirs()
+    copied, skipped = import_audio(cfg, args.paths, move=args.move)
+    for path in copied:
+        print(f"+ {path}")
+    print(f"скопійовано: {len(copied)}, пропущено (уже є): {len(skipped)}")
+    pipe = Pipeline(cfg)
+    try:
+        added = pipe.scan()
+    finally:
+        pipe.db.close()
+    print(f"нових аудіо в черзі: {len(added)}")
+    return 0
+
+
+def cmd_daemon(args) -> int:
+    cfg = _cfg(args)
+    cfg.ensure_dirs()
+    daemon = Daemon(cfg)
+    try:
+        return daemon.run(
+            once=args.once,
+            dry_run=args.dry_run,
+            max_videos=args.max,
+            sync=False if args.no_sync else None,
+        )
+    except KeyboardInterrupt:
+        print("\nзупинено")
+        return 0
 
 
 def cmd_scan(args) -> int:
@@ -279,7 +352,8 @@ def cmd_status(args) -> int:
             if j.url:
                 print(f"{'':>26}{j.url}")
             if j.error:
-                print(f"{'':>26}! {j.error.splitlines()[0][:70]}")
+                tries = f" (спроб: {j.attempts})" if j.attempts else ""
+                print(f"{'':>26}! {j.error.splitlines()[0][:60]}{tries}")
     print(f"\nквота YouTube сьогодні: {pipe.quota.used()} / {pipe.quota.daily_limit}")
     return 0
 
@@ -302,7 +376,7 @@ def cmd_reset(args) -> int:
     if not job:
         print(f"задачу {args.id} не знайдено")
         return 1
-    fields = {"status": args.to, "error": None}
+    fields = {"status": args.to, "error": None, "attempts": 0}
     if args.to == "new" and job.video_id and not args.forget_youtube:
         print("! відео вже на YouTube; рендер можна повторити, але завантаження не повториться.")
         print("  Щоб завантажити заново (як нове відео), додайте --forget-youtube")
@@ -378,6 +452,15 @@ def cmd_doctor(args) -> int:
     if not ok:
         problems += 1
 
+    import importlib.util
+
+    has_notebooklm = importlib.util.find_spec("notebooklm") is not None
+    line(
+        has_notebooklm,
+        "NotebookLM клієнт",
+        "є" if has_notebooklm else 'опційно: pip install "notebooklm-py[browser]"',
+    )
+
     secret = cfg.path(cfg.youtube.client_secret)
     token = cfg.path(cfg.youtube.token)
     line(token.exists(), "YouTube токен", "є" if token.exists() else "запустіть audiotube auth")
@@ -410,6 +493,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init", help="створити папки і config.yaml").set_defaults(func=cmd_init)
+
+    s = sub.add_parser("sync", help="завантажити аудіо з NotebookLM у inbox/<ноутбук>/")
+    s.add_argument("--dry-run", action="store_true", help="лише показати план, нічого не качати")
+    s.add_argument("--notebook", help="id, назва або частина назви ноутбука")
+    s.add_argument("--limit", type=int, help="не більше N нових файлів за запуск")
+    s.add_argument("--force", action="store_true", help="перекачати навіть наявні файли")
+    s.set_defaults(func=cmd_sync)
+
+    s = sub.add_parser("import", help="додати вже завантажені вручну аудіо")
+    s.add_argument("paths", nargs="+", help="файл або тека")
+    s.add_argument("--move", action="store_true", help="перемістити замість копіювання")
+    s.set_defaults(func=cmd_import)
 
     s = sub.add_parser("meta", help="шаблон метаданих (.yaml) поруч з аудіо")
     s.add_argument("audio", nargs="+")
@@ -459,6 +554,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-describe", action="store_true")
     s.add_argument("--no-render", action="store_true")
     s.set_defaults(func=cmd_watch)
+
+    s = sub.add_parser("daemon", help="автоматика: sync + рендер + публікація в межах квоти")
+    s.add_argument("--once", action="store_true", help="один цикл і вихід (для cron/systemd timer)")
+    s.add_argument("--dry-run", action="store_true", help="показати, що буде зроблено, і вийти")
+    s.add_argument("--no-sync", action="store_true", help="не звертатися до NotebookLM")
+    s.add_argument("--max", type=int, help="не більше N відео за цикл")
+    s.set_defaults(func=cmd_daemon)
 
     sub.add_parser("status", help="стан задач").set_defaults(func=cmd_status)
     sub.add_parser("playlists", help="плейлисти каналу").set_defaults(func=cmd_playlists)

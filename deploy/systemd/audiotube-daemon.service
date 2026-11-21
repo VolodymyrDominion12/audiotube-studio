@@ -1,0 +1,23 @@
+[Unit]
+Description=AudioTube Studio: NotebookLM -> YouTube (daemon)
+Documentation=file:%h/PycharmProjects/audiotube-studio/docs/06_AUTOMATION.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/PycharmProjects/audiotube-studio
+Environment=PYTHONUNBUFFERED=1
+Environment=NOTEBOOKLM_HOME=%h/.notebooklm
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# сесія NotebookLM «засинає» за тижні — освіжаємо перед стартом (помилку ігноруємо)
+ExecStartPre=-%h/.local/bin/notebooklm auth refresh --quiet
+ExecStart=%h/PycharmProjects/audiotube-studio/.venv/bin/audiotube daemon
+Restart=on-failure
+RestartSec=120
+# м'яка зупинка: демон дочіпує поточний крок і виходить
+KillSignal=SIGTERM
+TimeoutStopSec=600
+
+[Install]
+WantedBy=default.target

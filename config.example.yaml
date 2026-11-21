@@ -68,11 +68,34 @@ pipeline:
   auto_describe: true     # `run`/`watch` генерують метадані через LLM
   auto_render: true
 
+daemon:
+  interval_minutes: 30      # як часто перевіряти чергу
+  videos_per_day: 2         # денний бюджет (квота дозволяє ~4 відео)
+  min_hours_between: 6      # не частіше ніж раз на 6 годин
+  max_attempts: 3           # після стількох невдач задачу більше не чіпати
+  order: oldest             # oldest | newest
+  sync_before_run: true     # спершу забирати нове з NotebookLM
+  pause_seconds: 10         # пауза між відео в одному циклі
+  cleanup_video_after_upload: true   # видаляти .mp4 після успішної публікації
+  notify: false             # notify-send, якщо є в системі
+  quota_reserve: 0          # скільки одиниць квоти лишати недоторканими
+
+notebooklm:
+  enabled: true            # false = не синхронізувати автоматично (ручні команди працюють)
+  profile: default         # notebooklm -p <профіль>
+  home: null               # NOTEBOOKLM_HOME; null = ~/.notebooklm
+  include_shared: false    # чужі ноутбуки не чіпаємо
+  delay_seconds: 2         # пауза між завантаженнями
+  max_per_run: 20          # запобіжник на один запуск
+  repair_missing: true     # перекачати, якщо файл зник локально
+  filename_max_len: 40
+
 youtube:
   client_secret: data/client_secret.json   # OAuth-клієнт (Desktop app) з Google Cloud Console
   token: data/token.json
   default_privacy: private                 # private | unlisted | public
   playlist_privacy: public
+  manage_playlists: false                  # false = лише завантажувати; розкладання по плейлистах — вручну
   category_id: "27"                        # 27 = Education
   language: uk
   made_for_kids: false

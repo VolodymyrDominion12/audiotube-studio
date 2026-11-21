@@ -1,0 +1,14 @@
+[Unit]
+Description=AudioTube Studio: один цикл (sync + рендер + публікація)
+Documentation=file:%h/PycharmProjects/audiotube-studio/docs/06_AUTOMATION.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/PycharmProjects/audiotube-studio
+Environment=PYTHONUNBUFFERED=1
+Environment=NOTEBOOKLM_HOME=%h/.notebooklm
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=-%h/.local/bin/notebooklm auth refresh --quiet
+ExecStart=%h/PycharmProjects/audiotube-studio/.venv/bin/audiotube daemon --once

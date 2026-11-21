@@ -1,0 +1,11 @@
+[Unit]
+Description=AudioTube Studio: періодичний цикл кожні 30 хвилин
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+Unit=audiotube-once.service
+
+[Install]
+WantedBy=timers.target

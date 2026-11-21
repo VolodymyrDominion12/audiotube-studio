@@ -4,19 +4,23 @@
 плейлист) → відео з фоном і обкладинкою → завантаження на YouTube.
 
 - Концепція і план розвитку: [docs/01_CONCEPT.md](docs/01_CONCEPT.md)
+- План інтеграції з NotebookLM (синхронізація аудіопереказів → папки → автопублікація): [docs/05_NOTEBOOKLM_PLAN.md](docs/05_NOTEBOOKLM_PLAN.md)
+- Автоматика (демон, systemd, квота): [docs/06_AUTOMATION.md](docs/06_AUTOMATION.md)
 - Аналіз коду, рішення й наступні етапи: [docs/03_ANALYSIS_AND_NEXT_STEPS.md](docs/03_ANALYSIS_AND_NEXT_STEPS.md)
 - Налаштування транскрипції та LLM: [docs/04_LLM_AND_WHISPER.md](docs/04_LLM_AND_WHISPER.md)
 - Налаштування доступу до YouTube: [docs/02_YOUTUBE_SETUP.md](docs/02_YOUTUBE_SETUP.md)
 
 **Статус:** Фаза 1 (MVP) завершена; Фаза 2 реалізована — транскрипція, LLM-метадані, субтитри
-YouTube, веб-інтерфейс, watch-folder. Залишились зовнішні джерела фонів (Pexels/Pixabay) і
-тематичні слайди — див. [roadmap](docs/03_ANALYSIS_AND_NEXT_STEPS.md#7-що-робити-далі-за-пріоритетом).
+YouTube, веб-інтерфейс, watch-folder. Додано синхронізацію з NotebookLM (`sync`/`import`) і
+демон з денним бюджетом публікацій (`daemon`). Залишились зовнішні джерела фонів (Pexels/Pixabay),
+тематичні слайди й розклад публікацій — див. [roadmap](docs/03_ANALYSIS_AND_NEXT_STEPS.md#7-що-робити-далі-за-пріоритетом).
 
 ## Що потрібно
 
 - Python 3.10+ (перевірено на 3.14);
 - FFmpeg з `ffprobe` (і з `drawtext`/`libass` — для написів і вшитих субтитрів);
-- опційно: `faster-whisper` для локальної транскрипції та [Ollama](https://ollama.com) для LLM.
+- опційно: `faster-whisper` для локальної транскрипції, [Ollama](https://ollama.com) для LLM
+  і `notebooklm-py` із входом у Google — для завантаження аудіо з NotebookLM.
 
 ## Встановлення
 
@@ -25,18 +29,18 @@ sudo apt install ffmpeg
 cd ~/PycharmProjects/audiotube-studio
 
 # варіант з uv (як у цьому репозиторії)
-uv pip install -e ".[transcribe]"
+uv pip install -e ".[transcribe,notebooklm]"
 
 # або з pip
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[transcribe]"
+pip install -e ".[transcribe,notebooklm]"
 
 audiotube init        # створить папки і config.yaml
 audiotube doctor      # перевірить ffmpeg, шрифти, транскрипцію, LLM, токен
 ```
 
-`[transcribe]` ставить `faster-whisper` (локальна транскрипція). Якщо транскрипція не потрібна,
-достатньо `pip install -e .`.
+`[transcribe]` ставить `faster-whisper` (локальна транскрипція), `[notebooklm]` — клієнт
+NotebookLM. Якщо ні те, ні те не потрібно, достатньо `pip install -e .`.
 
 ## Швидкий старт
 
@@ -93,9 +97,42 @@ audiotube watch --once --no-render        # один прохід, без від
 audiotube watch --interval 300 --upload   # повна автоматика
 ```
 
+## Автоматика
+
+```bash
+audiotube daemon --dry-run        # що буде зроблено (без побічних ефектів)
+audiotube daemon --once --max 1   # один цикл, максимум одне відео
+audiotube daemon                  # безперервно: sync → рендер → upload
+```
+
+Демон тримає денний бюджет (`videos_per_day`, типово 2), мінімальний інтервал між відео,
+не виходить за квоту YouTube, після 3 невдач заморожує задачу й бере файловий лок, щоб два
+екземпляри не дублювали завантаження. Готові systemd-юніти — у `deploy/systemd/`, інструкції —
+[docs/06_AUTOMATION.md](docs/06_AUTOMATION.md).
+
+## NotebookLM
+
+```bash
+uv tool install "notebooklm-py[browser]"   # окремий CLI для входу в Google
+notebooklm login                            # один раз, у браузері
+notebooklm auth check --test --json
+
+audiotube sync --dry-run                    # план: що буде завантажено
+audiotube sync --limit 5                    # перші 5 нових аудіо
+audiotube sync                              # усе (за один запуск — до max_per_run)
+audiotube import ~/Downloads/notebook/      # аварійний шлях: вручну скачані файли
+```
+
+Файли лягають у `inbox/<ноутбук>/` разом із YAML поруч, далі — звичайний `audiotube run`.
+Повторний `sync` нічого не дублює: ключ ідемпотентності — id артефакту в NotebookLM.
+Відео за замовчуванням приватні, плейлисти не створюються (`youtube.manage_playlists: false`
+у прикладі конфігу) — розкласти по плейлистах можна вручну в Studio. Деталі й ризики:
+[docs/05_NOTEBOOKLM_PLAN.md](docs/05_NOTEBOOKLM_PLAN.md).
+
 ## Метадані
 
-`describe` створює `inbox/<аудіо>.yaml`, який можна редагувати вручну. Можна й почати з шаблону:
+`describe` створює `<аудіо>.yaml` поруч з файлом (у т.ч. в підпапках ноутбуків), який можна
+редагувати вручну. Можна й почати з шаблону:
 
 ```bash
 audiotube meta inbox/docker.mp3    # -> inbox/docker.yaml
@@ -195,7 +232,7 @@ new → transcribed → described → rendered → uploaded → done
 ## Тести
 
 ```bash
-python -m unittest discover -s tests          # 86 тестів
+python -m unittest discover -s tests          # 113 тестів
 ```
 
 Тести, що потребують FFmpeg, автоматично пропускаються, якщо його немає в `PATH`.
@@ -216,7 +253,11 @@ audiotube/
   metadata.py    YAML-метадані, ліміти YouTube
   youtube.py     OAuth, завантаження, субтитри, плейлисти, квота
   webui.py       локальний веб-інтерфейс
+  notebooklm.py  адаптер до NotebookLM (неофіційний клієнт)
+  sync.py        синхронізація ноутбуків -> inbox/<ноутбук>/
+  daemon.py      автоматичний цикл: бюджет, повтори, лок, очищення
   db.py          SQLite (data/audiotube.db)
-tests/           86 тестів, без мережі
+tests/           113 тестів; синк, демон і публікація — без мережі й FFmpeg
+deploy/systemd/  готові unit-файли для автозапуску
 docs/            концепція, аудит, інструкції
 ```

@@ -95,6 +95,8 @@ class YouTubeCfg(BaseModel):
     token: str = "data/token.json"
     default_privacy: Literal["private", "unlisted", "public"] = "private"
     playlist_privacy: Literal["private", "unlisted", "public"] = "public"
+    # false — не створювати плейлисти й не додавати відео в них (розкладання вручну)
+    manage_playlists: bool = True
     category_id: str = "27"
     language: str = "uk"
     made_for_kids: bool = False
@@ -113,6 +115,34 @@ class DescriptionCfg(BaseModel):
     default_tags: list[str] = Field(default_factory=list)
 
 
+class DaemonCfg(BaseModel):
+    """Автоматичний цикл `audiotube daemon`."""
+
+    interval_minutes: int = Field(30, ge=1)
+    videos_per_day: int = Field(2, ge=0, le=10)
+    min_hours_between: float = Field(6, ge=0, le=48)
+    max_attempts: int = Field(3, ge=1, le=20)
+    order: Literal["oldest", "newest"] = "oldest"
+    sync_before_run: bool = True
+    pause_seconds: float = Field(10, ge=0, le=600)
+    cleanup_video_after_upload: bool = True
+    notify: bool = False
+    quota_reserve: int = Field(0, ge=0)
+
+
+class NotebookLMCfg(BaseModel):
+    """Синхронізація аудіопереказів із NotebookLM (неофіційний клієнт notebooklm-py)."""
+
+    enabled: bool = False
+    profile: str = "default"
+    home: str | None = None  # NOTEBOOKLM_HOME; null = ~/.notebooklm
+    include_shared: bool = False  # чужі ноутбуки ( viewer/editor ) не синхронізуємо
+    delay_seconds: float = Field(2.0, ge=0, le=60)  # пауза між завантаженнями
+    max_per_run: int = Field(20, ge=1)  # запобіжник на один запуск
+    repair_missing: bool = True  # перекачати, якщо файл зник локально
+    filename_max_len: int = Field(40, ge=10, le=120)
+
+
 class Config(BaseModel):
     paths: PathsCfg = Field(default_factory=PathsCfg)
     render: RenderCfg = Field(default_factory=RenderCfg)
@@ -121,6 +151,8 @@ class Config(BaseModel):
     llm: LLMCfg = Field(default_factory=LLMCfg)
     plan: PlanCfg = Field(default_factory=PlanCfg)
     pipeline: PipelineCfg = Field(default_factory=PipelineCfg)
+    daemon: DaemonCfg = Field(default_factory=DaemonCfg)
+    notebooklm: NotebookLMCfg = Field(default_factory=NotebookLMCfg)
     youtube: YouTubeCfg = Field(default_factory=YouTubeCfg)
     description: DescriptionCfg = Field(default_factory=DescriptionCfg)
 
