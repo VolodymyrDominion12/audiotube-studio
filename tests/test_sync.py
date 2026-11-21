@@ -1,5 +1,7 @@
 """Синхронізація NotebookLM -> inbox/<ноутбук>/ (без мережі й без FFmpeg)."""
 
+import contextlib
+import io
 import json
 import shutil
 import tempfile
@@ -21,10 +23,12 @@ from audiotube.sync import SyncService, import_audio
 class FakeAdapter:
     """Підміняє notebooklm-py: віддає задані ноутбуки й пише фейкові байти."""
 
-    def __init__(self, notebooks, artifacts, fail=()):
+    def __init__(self, notebooks, artifacts, fail=(), fail_audio=(), content=None):
         self._notebooks = list(notebooks)
         self._artifacts = artifacts
         self.fail = set(fail)
+        self.fail_audio = set(fail_audio)  # ноутбуки, для яких audio() падає
+        self.content = dict(content or {})  # artifact_id -> байти (інакше — типові)
         self.downloads = []
         self.entered = 0
 
@@ -39,13 +43,15 @@ class FakeAdapter:
         return list(self._notebooks)
 
     async def audio(self, notebook_id):
+        if notebook_id in self.fail_audio:
+            raise NotebookLMError("тимчасова помилка API")
         return list(self._artifacts.get(notebook_id, []))
 
     async def download(self, notebook_id, artifact_id, dest):
         if artifact_id in self.fail:
             raise RuntimeError("мережа обірвалася")
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"fake-audio-" + artifact_id.encode())
+        dest.write_bytes(self.content.get(artifact_id, b"fake-audio-" + artifact_id.encode()))
         self.downloads.append((notebook_id, artifact_id, dest))
 
 
@@ -60,7 +66,9 @@ def artifact(aid="a1", title="Вступ", day=2):
     )
 
 
-class SyncTests(unittest.TestCase):
+class SyncTestCase(unittest.TestCase):
+    """Спільне оточення: тимчасовий корінь, БД і FakeAdapter з одним ноутбуком."""
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         (self.tmp / "config.yaml").write_text(
@@ -79,6 +87,8 @@ class SyncTests(unittest.TestCase):
     def service(self):
         return SyncService(self.cfg, db=self.db, adapter=self.adapter, log=lambda _m: None)
 
+
+class SyncTests(SyncTestCase):
     def test_downloads_and_registers(self):
         report = self.service().run()
         self.assertEqual(report.downloaded, 1)
@@ -196,6 +206,110 @@ class SyncTests(unittest.TestCase):
         self.assertIsNone(self.db.artifact("s1"))
 
 
+class ArtifactLifecycleTests(SyncTestCase):
+    """Спека 005: зниклі артефакти, безпечний --force, перейменування ноутбука."""
+
+    def test_removed_artifact_marked_missing(self):
+        """LIFE-AC1: артефакт зник із NotebookLM -> state=missing, файл і задача на місці."""
+        self.service().run()
+        path = Path(self.db.artifact("a1")["path"])
+        job_id = self.db.job_for_audio(path)
+        self.adapter._artifacts[self.nb.id] = []
+
+        report = self.service().run()
+
+        self.assertEqual(report.missing, 1)
+        self.assertEqual(self.db.artifact("a1")["state"], "missing")
+        self.assertTrue(path.exists())
+        self.assertIsNotNone(self.db.get(job_id))
+
+    def test_removed_notebook_marks_its_artifacts_missing(self):
+        """LIFE-R3: ноутбук зник цілком -> його артефакти missing."""
+        self.service().run()
+        self.adapter._notebooks = []
+        report = self.service().run()
+        self.assertEqual(report.missing, 1)
+        self.assertEqual(self.db.artifact("a1")["state"], "missing")
+
+    def test_notebook_filter_does_not_mark_others_missing(self):
+        """LIFE-R3: --notebook не робить відфільтровані ноутбуки «зниклими»."""
+        self.service().run()
+        self.service().run(notebook="інший")
+        self.assertEqual(self.db.artifact("a1")["state"], "downloaded")
+
+    def test_missing_artifact_restored(self):
+        """LIFE-AC2: артефакт повернувся -> state=downloaded без повторного завантаження."""
+        self.service().run()
+        arts = self.adapter._artifacts[self.nb.id]
+        self.adapter._artifacts[self.nb.id] = []
+        self.service().run()
+        self.adapter._artifacts[self.nb.id] = arts
+
+        report = self.service().run()
+
+        self.assertEqual(report.restored, 1)
+        self.assertEqual(self.db.artifact("a1")["state"], "downloaded")
+        self.assertEqual(len(self.adapter.downloads), 1)
+
+    def test_api_error_keeps_states(self):
+        """LIFE-AC3: помилка audio() — це не «зник», стани не змінюються."""
+        self.service().run()
+        self.adapter.fail_audio = {self.nb.id}
+        report = self.service().run()
+        self.assertEqual(report.missing, 0)
+        self.assertEqual(len(report.errors), 1)
+        self.assertEqual(self.db.artifact("a1")["state"], "downloaded")
+
+    def test_dry_run_reports_missing_without_writing(self):
+        """LIFE-R1 + SYNC-R12: dry-run показує зниклі, але не пише в БД."""
+        self.service().run()
+        self.adapter._artifacts[self.nb.id] = []
+        report = self.service().run(dry_run=True)
+        self.assertEqual(report.missing, 1)
+        self.assertEqual(self.db.artifact("a1")["state"], "downloaded")
+
+    def test_force_same_content_keeps_file(self):
+        """LIFE-AC4: --force з тим самим вмістом не перезаписує файл, .part прибрано."""
+        self.service().run()
+        path = Path(self.db.artifact("a1")["path"])
+        before = path.stat().st_mtime_ns
+
+        report = self.service().run(force=True)
+
+        self.assertEqual(report.downloaded, 0)
+        self.assertEqual(path.stat().st_mtime_ns, before)
+        self.assertEqual(list(self.cfg.inbox.rglob("*.part")), [])
+
+    def test_force_changed_content_never_overwrites(self):
+        """LIFE-R4: інший вміст під тим самим id не перезаписує файл і не створює задачу."""
+        self.service().run()
+        path = Path(self.db.artifact("a1")["path"])
+        original = path.read_bytes()
+        jobs_before = len(self.db.list())
+        self.adapter.content["a1"] = b"regenerated-audio"
+
+        report = self.service().run(force=True)
+
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(report.changed, 1)
+        self.assertEqual(len(self.db.list()), jobs_before)
+        self.assertEqual(list(self.cfg.inbox.rglob("*.part")), [])
+        self.assertEqual(sorted(p.name for p in path.parent.glob("*.m4a")), [path.name])
+
+    def test_notebook_rename_updates_title(self):
+        """LIFE-AC7: перейменування ноутбука оновлює title, slug і папка ті самі."""
+        self.service().run()
+        slug = self.db.notebook(self.nb.id)["slug"]
+        self.adapter._notebooks = [RemoteNotebook(id=self.nb.id, title="Docker: повний курс")]
+
+        self.service().run()
+
+        row = self.db.notebook(self.nb.id)
+        self.assertEqual(row["title"], "Docker: повний курс")
+        self.assertEqual(row["slug"], slug)
+        self.assertEqual(self.db.artifact("a1")["state"], "downloaded")
+
+
 class SyncCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -218,6 +332,26 @@ class SyncCliTests(unittest.TestCase):
             code = main(["--root", str(self.tmp), "sync"])
         self.assertEqual(code, 0)
         self.assertEqual(len(self.adapter.downloads), 1)
+
+    def test_missing_is_reported_by_sync_and_status(self):
+        """LIFE-R8: sync і status --missing показують зниклі перекази."""
+        with mock.patch("audiotube.cli.build_adapter", return_value=self.adapter):
+            main(["--root", str(self.tmp), "sync"])
+        self.adapter._artifacts[self.nb.id] = []
+
+        out = io.StringIO()
+        with mock.patch("audiotube.cli.build_adapter", return_value=self.adapter), \
+                contextlib.redirect_stdout(out):
+            code = main(["--root", str(self.tmp), "sync"])
+        self.assertEqual(code, 0)
+        self.assertIn("зникло з NotebookLM: 1", out.getvalue())
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main(["--root", str(self.tmp), "status", "--missing"])
+        self.assertEqual(code, 0)
+        self.assertIn("Docker за 20 хвилин", out.getvalue())
+        self.assertIn("Вступ", out.getvalue())
 
     def test_auth_error_exits_2(self):
         class Broken(FakeAdapter):

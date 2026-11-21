@@ -40,11 +40,11 @@ draft → approved → in-progress → implemented
 
 | # | Спека | Статус | Модулі |
 |---|-------|--------|--------|
-| 001 | [Синхронізація NotebookLM («Бібліотекар»)](001-notebooklm-sync/spec.md) | implemented (є прогалини → 005) | `notebooklm.py`, `sync.py` |
+| 001 | [Синхронізація NotebookLM («Бібліотекар»)](001-notebooklm-sync/spec.md) | implemented | `notebooklm.py`, `sync.py` |
 | 002 | [Конвеєр аудіо → відео](002-video-pipeline/spec.md) | implemented | `transcribe.py`, `planner.py`, `render.py`, `visuals.py` |
 | 003 | [Публікація на YouTube](003-youtube-publish/spec.md) | implemented | `youtube.py`, `db.QuotaTracker` |
 | 004 | [Демон публікацій («Видавець»)](004-publish-daemon/spec.md) | implemented | `daemon.py`, `deploy/systemd/` |
-| 005 | [Версії й зникнення артефактів](005-artifact-lifecycle/spec.md) | draft | `sync.py`, `db.py` |
+| 005 | [Версії й зникнення артефактів](005-artifact-lifecycle/spec.md) | implemented | `sync.py`, `db.py` |
 | 006 | [Ноутбук → плейлист](006-notebook-playlists/spec.md) | draft (відкладено) | `youtube.py`, `sync.py` |
 | 007 | [Сповіщення в Telegram](007-telegram-notify/spec.md) | draft | `daemon.py` |
 | 008 | [Вкладка «Ноутбуки» у веб-UI](008-webui-notebooks/spec.md) | draft | `webui.py` |

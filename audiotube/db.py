@@ -233,6 +233,24 @@ class Database:
         )
         self.conn.commit()
 
+    def artifacts(
+        self, *, notebook_id: str | None = None, state: str | None = None
+    ) -> list[sqlite3.Row]:
+        sql, args = "SELECT * FROM artifacts WHERE 1=1", []
+        if notebook_id is not None:
+            sql += " AND notebook_id=?"
+            args.append(notebook_id)
+        if state is not None:
+            sql += " AND state=?"
+            args.append(state)
+        return self.conn.execute(sql + " ORDER BY notebook_id, created_at", args).fetchall()
+
+    def set_artifact_state(self, artifact_ids: list[str], state: str) -> None:
+        self.conn.executemany(
+            "UPDATE artifacts SET state=? WHERE id=?", [(state, aid) for aid in artifact_ids]
+        )
+        self.conn.commit()
+
     def link_artifact_job(self, artifact_id: str, job_id: int) -> None:
         self.conn.execute("UPDATE artifacts SET job_id=? WHERE id=?", (job_id, artifact_id))
         self.conn.commit()

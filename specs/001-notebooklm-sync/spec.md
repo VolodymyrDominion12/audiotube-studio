@@ -84,5 +84,5 @@ VI — паузи, `max_per_run`, `--dry-run`; VII — тести на `FakeAdap
 ## 9. Відомі прогалини (as-built vs дизайн)
 
 Дизайн у docs/05 (розд. 4.2) передбачає стани `superseded` (той самий id, інший хеш) і `missing`
-(артефакт зник з NotebookLM), а також `--rename-folders`. Код їх **не реалізує** — винесено в
-[005](../005-artifact-lifecycle/spec.md).
+(артефакт зник з NotebookLM), а також `--rename-folders`. `missing` і безпечний `--force` уже
+реалізовані в [005](../005-artifact-lifecycle/spec.md); від `superseded` свідомо відмовилися (005, §9); `--rename-folders` не реалізовано.

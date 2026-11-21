@@ -1,6 +1,6 @@
 # 005 · Версії й зникнення артефактів
 
-**Статус:** draft · **Версія:** 0.1 · **Дата:** 2026-11-21
+**Статус:** implemented · **Версія:** 1.0 · **Дата:** 2026-11-21
 **Залежить від:** 001 · **Модулі:** `sync.py`, `db.py`, `cli.py`
 
 ## 1. Проблема
@@ -30,11 +30,11 @@
 | LIFE-R1 | Якщо артефакт є в БД, але відсутній у відповіді NotebookLM для свого ноутбука, синк МУСИТЬ встановити `state='missing'` і показати це у звіті. Локальний файл і задача не змінюються. |
 | LIFE-R2 | Якщо `missing`-артефакт знову з'явився — повернути `state='downloaded'`. |
 | LIFE-R3 | Якщо ноутбук не прийшов у відповіді взагалі (видалено/втрачено доступ) — його артефакти теж `missing`; якщо `api.audio()` впав з помилкою — стани НЕ змінюються (помилка ≠ відсутність). |
-| LIFE-R4 | `sync --force` НЕ МОЖЕ перезаписати наявний файл. Новий файл качається в `.part`; якщо sha256 збігається зі збереженим — `.part` видаляється, стан без змін. |
-| LIFE-R5 | Якщо sha256 відрізняється — нова версія зберігається поруч як `<stem>.v2.m4a` (v3, …), стара лишається; у БД попередня версія отримує `state='superseded'`, нова — `downloaded`. |
-| LIFE-R6 | Нова версія реєструється як окрема задача, але якщо задача попередньої версії вже `uploaded`/`done`, нова задача отримує статус `held` [NEEDS CLARIFICATION: новий статус чи `attempts=max`?] і демон її не публікує без ручного `audiotube reset`. |
+| LIFE-R4 | `sync --force` НЕ МОЖЕ перезаписати наявний файл. Новий файл качається в `.part`; якщо sha256 збігається зі збереженим — `.part` видаляється, стан без змін. Якщо не збігається — до реалізації R5 `.part` теж видаляється, а у звіті з'являється `changed` (локальний файл, задача й БД не змінюються). |
+| LIFE-R5 | ~~Зберігати нову версію поруч (`.v2.m4a`, `superseded`).~~ **Відхилено 2026-11-21** — див. §9. |
+| LIFE-R6 | ~~Ставити нову версію вже опублікованого на паузу (`held`).~~ **Відхилено 2026-11-21** — див. §9. |
 | LIFE-R7 | При кожному синку `notebooks.title` оновлюється з NotebookLM; slug і папка — ні. *(Уже так працює — `save_notebook` + slug з БД; бракує лише регресійного тесту.)* |
-| LIFE-R8 | `audiotube sync` виводить окремі лічильники: `missing`, `superseded`. |
+| LIFE-R8 | `audiotube sync` виводить окремі лічильники: зниклі, повернуті, змінені; `audiotube status --missing` показує зниклі перекази зі станом їхніх задач. |
 
 ## 5. Нефункціональні вимоги
 
@@ -43,22 +43,19 @@
 
 ## 6. Інтерфейси
 
-- БД: значення `artifacts.state ∈ {downloaded, missing, superseded}`; нова колонка `artifacts.version INTEGER DEFAULT 1`
-  і `artifacts.local_id` [NEEDS CLARIFICATION: PK зараз = `id` з NotebookLM; для кількох версій одного id
-  потрібен або складений ключ `(id, version)`, або окрема таблиця `artifact_versions`].
+- БД: `artifacts.state ∈ {downloaded, missing}` (колонка вже була — міграції не потрібні).
 - CLI: нові рядки у звіті `sync`; `audiotube status --missing`.
 
 ## 7. Критерії приймання
 
 | ID | Given / When / Then | Тест |
 |----|---------------------|------|
-| LIFE-AC1 | **Given** синкнутий артефакт **When** NotebookLM більше його не повертає **Then** `state=missing`, файл на місці | новий |
-| LIFE-AC2 | **Given** `missing` **When** артефакт повернувся **Then** `state=downloaded` | новий |
-| LIFE-AC3 | **Given** `api.audio()` кидає помилку **Then** стани не змінені | новий |
-| LIFE-AC4 | **Given** той самий вміст **When** `sync --force` **Then** файл не перезаписаний (mtime той самий), `.part` прибрано | новий |
-| LIFE-AC5 | **Given** інший вміст **When** `sync --force` **Then** `.v2.m4a` поруч, стара версія `superseded` | новий |
-| LIFE-AC6 | **Given** стара версія `done` **Then** нова задача не публікується демоном | новий |
-| LIFE-AC7 | **Given** ноутбук перейменовано **Then** title оновлено, папка та сама | новий |
+| LIFE-AC1 | **Given** синкнутий артефакт **When** NotebookLM більше його не повертає **Then** `state=missing`, файл на місці | `test_sync.py::ArtifactLifecycleTests::test_removed_artifact_marked_missing`, `::test_removed_notebook_marks_its_artifacts_missing`, `::test_notebook_filter_does_not_mark_others_missing`, `::test_dry_run_reports_missing_without_writing` |
+| LIFE-AC2 | **Given** `missing` **When** артефакт повернувся **Then** `state=downloaded` | `test_sync.py::ArtifactLifecycleTests::test_missing_artifact_restored` |
+| LIFE-AC3 | **Given** `api.audio()` кидає помилку **Then** стани не змінені | `test_sync.py::ArtifactLifecycleTests::test_api_error_keeps_states` |
+| LIFE-AC4 | **Given** той самий вміст **When** `sync --force` **Then** файл не перезаписаний (mtime той самий), `.part` прибрано | `test_sync.py::ArtifactLifecycleTests::test_force_same_content_keeps_file`, `::test_force_changed_content_never_overwrites` |
+| LIFE-AC7 | **Given** ноутбук перейменовано **Then** title оновлено, папка та сама | `test_sync.py::ArtifactLifecycleTests::test_notebook_rename_updates_title` |
+| LIFE-AC9 | **When** `sync` після зникнення **Then** «зникло з NotebookLM: 1»; `status --missing` показує переказ | `test_sync.py::SyncCliTests::test_missing_is_reported_by_sync_and_status` |
 | LIFE-AC8 | Усі тести 001 (SYNC-AC1…14) лишаються зеленими | `tests/test_sync.py` |
 
 ## 8. Відповідність конституції
@@ -66,8 +63,9 @@
 III — `missing` не спричиняє дій; IV — головна мета спеки (жодного перезапису); V — лише через `Adapter`;
 VI — перегенерація лише за явним `--force`.
 
-## 9. Відкриті питання
+## 9. Рішення
 
-- [NEEDS CLARIFICATION: модель даних для версій — `(id, version)` чи окрема таблиця?]
-- [NEEDS CLARIFICATION: як позначати «нову версію вже опублікованого» — статус `held` чи інший механізм?]
-- [NEEDS CLARIFICATION: чи взагалі буває перегенерація з тим самим `artifact_id`? Перевірити на реальному акаунті — якщо NotebookLM завжди дає новий id, LIFE-R4…R6 спрощуються до «не перезаписувати».]
+**2026-11-21:** версії артефактів (LIFE-R5/R6) не реалізуємо. NotebookLM при перегенерації,
+найімовірніше, створює новий `artifact_id`, тож нова версія і так скачується як окремий переказ.
+Якщо `sync --force` колись покаже `changed` (той самий id, інший вміст), — повертаємося до цієї
+спеки з реальним прикладом. До того часу `changed` лише інформує й нічого не змінює.

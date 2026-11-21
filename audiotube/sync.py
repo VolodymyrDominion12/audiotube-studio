@@ -48,7 +48,7 @@ _GENERIC_TITLES = {
 
 @dataclass
 class SyncItem:
-    action: str  # download | repair | skip | plan | error
+    action: str  # download | repair | skip | plan | error | missing | restored | changed
     notebook: str
     title: str
     path: Path | None = None
@@ -62,6 +62,9 @@ class SyncReport:
     downloaded: int = 0
     skipped: int = 0
     planned: int = 0
+    missing: int = 0  # зникли з NotebookLM у цьому прогоні (файли лишаються)
+    restored: int = 0  # були missing і знову з'явилися
+    changed: int = 0  # --force: той самий id, інший вміст (версії ще не підтримуються)
     errors: list[str] = field(default_factory=list)
     items: list[SyncItem] = field(default_factory=list)
 
@@ -149,6 +152,9 @@ class SyncService:
 
         async with adapter as api:
             remote = await api.notebooks()
+            # «Існує» рахуємо до фільтрів: відфільтрований ноутбук не є зниклим
+            if not notebook:
+                self._reconcile_notebooks({nb.id for nb in remote}, report, dry_run=dry_run)
             if not self.cfg.notebooklm.include_shared:
                 remote = [nb for nb in remote if not nb.shared]
             if notebook:
@@ -171,8 +177,11 @@ class SyncService:
                 try:
                     artifacts = await api.audio(nb.id)
                 except NotebookLMError as e:
+                    # помилка API — не доказ, що артефакти зникли: стани не чіпаємо
                     report.errors.append(f"{nb.title}: {e}")
                     continue
+
+                self._reconcile_artifacts(nb, {a.id for a in artifacts}, report, dry_run=dry_run)
 
                 for art in sorted(artifacts, key=lambda a: (_created_key(a), a.title)):
                     if stop:
@@ -211,9 +220,12 @@ class SyncService:
             )
             return
 
-        if existing and existing.exists() and not force:
-            report.skipped += 1
-            report.items.append(SyncItem("skip", nb.title, title, existing, art.id, "уже є"))
+        if existing and existing.exists():
+            if force:
+                await self._verify(api, nb, art, title, existing, row, report, dry_run=dry_run)
+            else:
+                report.skipped += 1
+                report.items.append(SyncItem("skip", nb.title, title, existing, art.id, "уже є"))
             return
 
         action = "repair" if existing else "download"
@@ -273,6 +285,87 @@ class SyncService:
         if delay > 0:
             await asyncio.sleep(delay)
         return
+
+    async def _verify(
+        self,
+        api: Adapter,
+        nb: RemoteNotebook,
+        art: RemoteArtifact,
+        title: str,
+        existing: Path,
+        row,
+        report: SyncReport,
+        *,
+        dry_run: bool,
+    ) -> None:
+        """--force для наявного файлу: перекачати в .part і порівняти, але ніколи не перезаписувати."""
+        if dry_run:
+            report.skipped += 1
+            report.items.append(
+                SyncItem("skip", nb.title, title, existing, art.id, "буде перевірено (--force)")
+            )
+            return
+
+        part = existing.with_name(existing.name + ".part")
+        try:
+            await api.download(nb.id, art.id, part)
+            digest = _sha256(part)
+        except Exception as e:  # noqa: BLE001
+            report.errors.append(f"{nb.title} / {title}: {e}")
+            report.items.append(SyncItem("error", nb.title, title, None, art.id, str(e)))
+            return
+        finally:
+            part.unlink(missing_ok=True)
+
+        if digest == row["sha256"]:
+            report.skipped += 1
+            report.items.append(SyncItem("skip", nb.title, title, existing, art.id, "не змінився"))
+        else:
+            # Версії (LIFE-R5/R6) ще не реалізовані: локальний файл, можливо, вже на YouTube,
+            # тож нову версію лише показуємо, а не підміняємо нею стару.
+            report.changed += 1
+            report.items.append(
+                SyncItem(
+                    "changed", nb.title, title, existing, art.id,
+                    "вміст у NotebookLM змінився; локальний файл не чіпаємо",
+                )
+            )
+
+        delay = self.cfg.notebooklm.delay_seconds
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    # --- зниклі артефакти (спека 005) ----------------------------------------
+    def _reconcile_notebooks(self, alive: set[str], report: SyncReport, *, dry_run: bool) -> None:
+        """Ноутбук пропав із NotebookLM цілком -> усі його артефакти missing."""
+        for row in self.db.notebooks():
+            if row["id"] in alive:
+                continue
+            gone = self.db.artifacts(notebook_id=row["id"], state="downloaded")
+            self._mark(gone, "missing", row["title"], report, dry_run=dry_run)
+
+    def _reconcile_artifacts(
+        self, nb: RemoteNotebook, alive: set[str], report: SyncReport, *, dry_run: bool
+    ) -> None:
+        rows = self.db.artifacts(notebook_id=nb.id)
+        gone = [r for r in rows if r["state"] == "downloaded" and r["id"] not in alive]
+        back = [r for r in rows if r["state"] == "missing" and r["id"] in alive]
+        self._mark(gone, "missing", nb.title, report, dry_run=dry_run)
+        self._mark(back, "downloaded", nb.title, report, dry_run=dry_run)
+
+    def _mark(self, rows, state: str, notebook: str, report: SyncReport, *, dry_run: bool) -> None:
+        if not rows:
+            return
+        action = "missing" if state == "missing" else "restored"
+        for r in rows:
+            path = Path(r["path"]) if r["path"] else None
+            report.items.append(SyncItem(action, notebook, r["title"] or r["id"], path, r["id"], ""))
+        if action == "missing":
+            report.missing += len(rows)
+        else:
+            report.restored += len(rows)
+        if not dry_run:
+            self.db.set_artifact_state([r["id"] for r in rows], state)
 
     # --- допоміжне ----------------------------------------------------------
     @staticmethod

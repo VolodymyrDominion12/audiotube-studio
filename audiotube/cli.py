@@ -101,11 +101,16 @@ def cmd_sync(args) -> int:
     finally:
         db.close()
 
+    marks = {"plan": "~", "download": "+", "repair": "+", "missing": "-", "restored": "↺", "changed": "?"}
+    notes = {
+        "missing": "  (зник із NotebookLM; локальний файл лишається)",
+        "restored": "  (знову є в NotebookLM)",
+        "changed": "  (вміст змінився в NotebookLM; локальний файл не змінено)",
+    }
     for item in report.items:
-        if item.action in {"plan", "download", "repair"}:
-            mark = "~" if item.action == "plan" else "+"
+        if item.action in marks:
             name = item.path.name if item.path else item.title
-            print(f" {mark} [{item.notebook}] {name}")
+            print(f" {marks[item.action]} [{item.notebook}] {name}{notes.get(item.action, '')}")
     for err in report.errors:
         print(f" ! {err}", file=sys.stderr)
 
@@ -114,6 +119,17 @@ def cmd_sync(args) -> int:
         f"ноутбуків: {report.notebooks}, {prefix}: {report.total_new}, "
         f"пропущено: {report.skipped}, помилок: {len(report.errors)}"
     )
+    extra = [
+        (label, n)
+        for label, n in (
+            ("зникло з NotebookLM", report.missing),
+            ("повернулося", report.restored),
+            ("змінилося", report.changed),
+        )
+        if n
+    ]
+    if extra:
+        print(", ".join(f"{label}: {n}" for label, n in extra))
     print(f"тека: {cfg.inbox}")
     return 0 if not report.errors else 1
 
@@ -339,6 +355,11 @@ def cmd_watch(args) -> int:
 
 def cmd_status(args) -> int:
     pipe = Pipeline(_cfg(args))
+    if getattr(args, "missing", False):
+        try:
+            return _print_missing(pipe.db)
+        finally:
+            pipe.db.close()
     jobs = pipe.db.list()
     if not jobs:
         print("задач поки немає. Покладіть аудіо в inbox/ і виконайте: audiotube scan")
@@ -355,6 +376,22 @@ def cmd_status(args) -> int:
                 tries = f" (спроб: {j.attempts})" if j.attempts else ""
                 print(f"{'':>26}! {j.error.splitlines()[0][:60]}{tries}")
     print(f"\nквота YouTube сьогодні: {pipe.quota.used()} / {pipe.quota.daily_limit}")
+    return 0
+
+
+def _print_missing(db: Database) -> int:
+    rows = db.artifacts(state="missing")
+    if not rows:
+        print("усі синхронізовані перекази є в NotebookLM")
+        return 0
+    titles = {r["id"]: r["title"] for r in db.notebooks()}
+    print(f"зникли з NotebookLM ({len(rows)}); локальні файли й задачі не змінено:")
+    for r in rows:
+        job = db.get(r["job_id"]) if r["job_id"] else None
+        state = STATUS_UA.get(job.status, job.status) if job else "без задачі"
+        print(f" - [{titles.get(r['notebook_id'], r['notebook_id'])}] {r['title']}  ({state})")
+        if r["path"]:
+            print(f"   {r['path']}")
     return 0
 
 
@@ -562,7 +599,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max", type=int, help="не більше N відео за цикл")
     s.set_defaults(func=cmd_daemon)
 
-    sub.add_parser("status", help="стан задач").set_defaults(func=cmd_status)
+    s = sub.add_parser("status", help="стан задач")
+    s.add_argument("--missing", action="store_true", help="перекази, що зникли з NotebookLM")
+    s.set_defaults(func=cmd_status)
     sub.add_parser("playlists", help="плейлисти каналу").set_defaults(func=cmd_playlists)
 
     s = sub.add_parser("reset", help="повернути задачу на крок")
