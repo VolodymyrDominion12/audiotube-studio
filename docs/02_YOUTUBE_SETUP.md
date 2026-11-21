@@ -4,24 +4,43 @@
 
 ## 1. Проєкт і API
 
-1. Відкрийте https://console.cloud.google.com/ → створіть новий проєкт (напр. `audiotube`).
-2. **APIs & Services → Library** → знайдіть **YouTube Data API v3** → **Enable**.
+1. Відкрийте https://console.cloud.google.com/ → у перемикачі проєктів угорі (поруч із логотипом Google Cloud) натисніть **New project** → назва, напр. `audiotube` → **Create**.
+2. Переконайтеся, що в перемикачі вибрано саме цей проєкт.
+3. **APIs & Services → Library** → знайдіть **YouTube Data API v3** → **Enable**.
 
-## 2. Екран згоди OAuth
+> Беріть окремий проєкт, а не наявний (напр. від Apps Script). Якщо в проєкті OAuth уже колись налаштовували, майстра з вибором типу користувачів не буде — одразу відкриється **Overview** з метриками.
 
-1. **APIs & Services → OAuth consent screen** (або «Google Auth Platform»).
-2. Тип користувачів: **External**.
-3. Заповніть назву застосунку і свою пошту.
-4. У **Test users** додайте пошту Google-акаунта, на якому ваш YouTube-канал.
+## 2. Google Auth Platform (екран згоди OAuth)
+
+Колишній «OAuth consent screen» тепер називається **Google Auth Platform** (меню **APIs & Services → OAuth consent screen** веде туди ж). Ліве меню: Overview, Branding, Audience, Clients, Data Access, Verification Center, Settings.
+
+1. Відкрийте **Google Auth Platform** → у новому проєкті натисніть **Get started**.
+2. Пройдіть майстер:
+   - **App Information** — назва застосунку і ваша пошта для підтримки;
+   - **Audience** — тип користувачів **External**;
+   - **Contact Information** — ваша пошта;
+   - **Finish** — погодьтеся з умовами → **Create**.
+3. **Audience → Test users → Add users** — додайте пошту Google-акаунта, на якому ваш YouTube-канал.
+
+Де що шукати пізніше:
+
+| Що | Де в Google Auth Platform |
+|---|---|
+| Тип користувачів (External/Internal) | **Audience** → *User type* |
+| Тестові користувачі | **Audience** → *Test users* |
+| Перехід у Production | **Audience** → *Publishing status* → **Publish app** |
+| Назва застосунку, пошта | **Branding** |
+| OAuth-клієнти | **Clients** |
 
 > Поки застосунок у режимі **Testing**, токен діє лише 7 днів — потім треба знову виконати `audiotube auth`.
-> Щоб цього уникнути, натисніть **Publish app** (перехід у Production). Для особистого використання проходити верифікацію не обов'язково: при вході Google покаже попередження «застосунок не перевірено» — натисніть «Додатково → Перейти».
+> Щоб цього уникнути, натисніть **Audience → Publish app** (перехід у Production). Для особистого використання проходити верифікацію не обов'язково: при вході Google покаже попередження «застосунок не перевірено» — натисніть «Додатково → Перейти».
 
 ## 3. OAuth-клієнт
 
-1. **APIs & Services → Credentials → Create credentials → OAuth client ID**.
-2. Тип: **Desktop app**.
-3. Завантажте JSON і збережіть як `data/client_secret.json` у папці проєкту.
+1. **Google Auth Platform → Clients → Create client** (або **APIs & Services → Credentials → Create credentials → OAuth client ID**).
+2. Application type: **Desktop app**, назва — будь-яка → **Create**.
+3. У вікні з ідентифікатором натисніть **Download JSON** і збережіть файл як `data/client_secret.json` у папці проєкту.
+   Якщо вікно вже закрили — **Clients** → ваш клієнт → **Download JSON** (кнопка завантаження біля секрету).
 
 ## 4. Авторизація
 
