@@ -14,6 +14,7 @@ dependencies = [
     "google-api-python-client>=2.100",
     "google-auth-oauthlib>=1.1",
     "google-auth-httplib2>=0.1",
+    "notebooklm-py[browser]>=0.8.6",
 ]
 
 [project.optional-dependencies]
