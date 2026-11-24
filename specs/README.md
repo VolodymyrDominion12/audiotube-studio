@@ -51,6 +51,8 @@ draft → approved → in-progress → implemented
 | 009 | [Поділ субтитрів за часом і швидкістю читання](009-subtitle-timing/spec.md) | implemented | `transcript.py`, `subtitles.py` |
 | 010 | [Публікація завантаженого відео](010-publish-command/spec.md) | implemented | `youtube.py`, `cli.py` |
 | 011 | [Веб-інтерфейс: публікація, лічильники, фільтри](011-webui-publish-filters/spec.md) | implemented | `webui.py` |
+| 012 | [Нічний пакетний прогін](012-nightly-run/spec.md) | implemented | `cli.py`, `pipeline.py` |
+| 013 | [Дорендер аудіо без відео](013-missing-video-render/spec.md) | implemented | `cli.py` |
 
 Спеки 001–004 написані **після** коду (reverse-engineered): вони фіксують поточну поведінку
 як контракт, щоб подальші зміни не ламали її непомітно.

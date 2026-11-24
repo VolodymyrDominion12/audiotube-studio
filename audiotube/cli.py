@@ -340,6 +340,13 @@ def _has_transcript(pipe: Pipeline, job) -> bool:
     return path.exists()
 
 
+def _has_video(job) -> bool:
+    """Чи має задача відео: локальний файл або вже завантажене на YouTube (spec 013)."""
+    if job.video_id:
+        return True
+    return bool(job.video and job.video.is_file())
+
+
 def _process(
     pipe: Pipeline,
     *,
@@ -348,34 +355,56 @@ def _process(
     render: bool,
     upload: bool,
     force: bool = False,
+    force_describe: bool = False,
+    limit: int | None = None,
+    missing_video: bool = False,
+    no_upload: bool = False,
 ) -> None:
-    """Один прохід конвеєра по всіх незавершених задачах."""
+    """Один прохід конвеєра по незавершених задачах (опційно — лише перші N).
+
+    `missing_video`: брати всі задачі без відео, незалежно від статусу (spec 013).
+    `no_upload`: жодної публікації, навіть якщо `youtube.auto_upload: true`.
+    """
     cfg = pipe.cfg
     pipe.scan()
-    jobs = pipe.db.list(("new", "transcribed", "described"))
+    if missing_video:
+        jobs = [job for job in pipe.db.list() if not _has_video(job)]
+    else:
+        jobs = pipe.db.list(("new", "transcribed", "described"))
+    if limit is not None:
+        jobs = jobs[:limit]
     for job in jobs:
-        if transcribe and cfg.pipeline.auto_transcribe and job.status == "new":
+        needs_transcript = job.status == "new" or (
+            missing_video and not _has_transcript(pipe, job)
+        )
+        if transcribe and cfg.pipeline.auto_transcribe and needs_transcript:
             job = pipe.transcribe(job, force=force)
 
+        needs_describe = (
+            STATUS_ORDER[job.status] < STATUS_ORDER["described"] or force_describe
+        )
         if (
             describe
             and cfg.pipeline.auto_describe
             and cfg.llm.provider != "none"
-            and STATUS_ORDER[job.status] < STATUS_ORDER["described"]
+            and needs_describe
             and _has_transcript(pipe, job)
         ):
-            job = pipe.describe(job, force=force)
+            job = pipe.describe(job, force=force or force_describe)
 
-        if render and cfg.pipeline.auto_render and STATUS_ORDER[job.status] < STATUS_ORDER["rendered"]:
-            pipe.render(job, force=force)
+        needs_render = STATUS_ORDER[job.status] < STATUS_ORDER["rendered"] or missing_video
+        if render and cfg.pipeline.auto_render and needs_render:
+            pipe.render(job, force=force or missing_video)
 
-    if upload or cfg.youtube.auto_upload:
+    if not no_upload and (upload or cfg.youtube.auto_upload):
         for job in pipe.db.list(("rendered", "uploaded")):
             pipe.publish(job)
 
 
 def cmd_run(args) -> int:
     cfg = _cfg(args)
+    if args.missing_video and args.upload:
+        raise SystemExit("--missing-video не поєднується з --upload: публікація на YouTube вимкнена")
     if not args.no_render:
         require_ffmpeg()
     pipe = Pipeline(cfg)
@@ -388,6 +417,10 @@ def cmd_run(args) -> int:
         describe=not args.no_describe,
         render=not args.no_render,
         upload=args.upload,
+        force_describe=args.force_describe,
+        limit=args.limit,
+        missing_video=args.missing_video,
+        no_upload=args.no_upload or args.missing_video,
     )
     return cmd_status(args)
 
@@ -613,6 +646,17 @@ def cmd_doctor(args) -> int:
     return 0 if problems == 0 else 1
 
 
+def _positive_int(value: str) -> int:
+    """argparse-тип для лічильників: ціле >= 1 (NIGHT-R3)."""
+    try:
+        number = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"очікується ціле число, отримано {value!r}") from e
+    if number < 1:
+        raise argparse.ArgumentTypeError("значення має бути >= 1")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="audiotube", description="Аудіорозбори -> YouTube-відео")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -680,10 +724,27 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_publish)
 
     s = sub.add_parser("run", help="scan + transcribe + describe + render (+ upload)")
-    s.add_argument("--upload", action="store_true", help="завантажити навіть якщо auto_upload вимкнено")
+    publish = s.add_mutually_exclusive_group()
+    publish.add_argument("--upload", action="store_true", help="завантажити навіть якщо auto_upload вимкнено")
+    publish.add_argument(
+        "--no-upload", action="store_true",
+        help="не публікувати навіть якщо youtube.auto_upload: true",
+    )
     s.add_argument("--no-transcribe", action="store_true", help="не робити транскрипцію")
     s.add_argument("--no-describe", action="store_true", help="не генерувати метадані через LLM")
     s.add_argument("--no-render", action="store_true", help="тільки підготувати дані, без відео")
+    s.add_argument(
+        "--force-describe", action="store_true",
+        help="перегенерувати метадані LLM навіть якщо YAML уже існує (напр. від sync)",
+    )
+    s.add_argument(
+        "--limit", type=_positive_int, metavar="N",
+        help="обробити щонайбільше N задач черги за цей запуск",
+    )
+    s.add_argument(
+        "--missing-video", action="store_true",
+        help="дорендерити всі аудіо, у яких немає відео (без публікації на YouTube)",
+    )
     s.set_defaults(func=cmd_run)
 
     s = sub.add_parser("watch", help="стежити за inbox/ і обробляти нові аудіо")

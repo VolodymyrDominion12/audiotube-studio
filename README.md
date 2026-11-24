@@ -84,6 +84,20 @@ audiotube status
 
 Пропустити окремі кроки: `audiotube run --no-transcribe`, `--no-describe`, `--no-render`.
 
+`sync` уже створює YAML-заготовку, тому для повного опису, тегів і глав потрібен
+`audiotube run --force-describe`. Обмежити нічний прогін: `--limit N` (наприклад,
+`audiotube run --force-describe --limit 10`).
+
+Дорендерити всі аудіо, у яких ще немає відео, і **нічого не заливати на YouTube**:
+
+```bash
+audiotube run --missing-video --limit 10    # 10 задач за запуск; без --limit — уся черга
+audiotube run --no-upload                   # звичайний run без публікації
+```
+
+`--missing-video` дивиться на фактичний файл `output/<slug>.mp4` (або `video_id`), а не на
+статус, тож дорендерить і задачу, у якої відео зникло. Задачі з наявним відео не перезаписуються.
+
 ## Веб-інтерфейс
 
 ```bash
@@ -277,7 +291,7 @@ audiotube/
   daemon.py      автоматичний цикл: бюджет, повтори, лок, очищення
   notify.py      сповіщення демона: Telegram / notify-send
   db.py          SQLite (data/audiotube.db)
-tests/           169 тестів; синк, демон і публікація — без мережі й FFmpeg
+tests/           181 тест; синк, демон і публікація — без мережі й FFmpeg
 deploy/systemd/  готові unit-файли для автозапуску
 docs/            концепція, аудит, інструкції
 ```

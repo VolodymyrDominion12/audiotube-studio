@@ -108,9 +108,28 @@ audiotube run                       # transcribe → describe → render для 
 audiotube run --upload              # + завантаження (навіть якщо auto_upload: false)
 audiotube run --no-transcribe       # пропустити крок (так само --no-describe, --no-render)
 
+audiotube run --force-describe      # перегенерувати метадані, навіть якщо YAML уже є
+audiotube run --limit 10            # лише перші 10 незавершених задач
+audiotube run --force-describe --limit 10   # нічний прогін беклогу
+
+audiotube run --missing-video       # усі аудіо без output/<slug>.mp4 → транскрипт → метадані → рендер
+audiotube run --missing-video --limit 10    # те саме, але 10 задач за запуск
+audiotube run --no-upload           # не публікувати навіть якщо auto_upload: true
+
 audiotube watch --interval 300      # реагувати на нові файли в inbox/
 audiotube watch --once              # один прохід і вихід
 ```
+
+> `--missing-video` вибирає задачі за **фактичною наявністю відео** (локальний файл або
+> `video_id` на YouTube), а не за статусом: задача зі статусом `rendered`, у якої файл зник,
+> буде дорендерена. Режим **ніколи не публікує** — `auto_upload` ігнорується, а поєднання з
+> `--upload` є помилкою. Задачі з наявним відео не перезаписуються. `--limit N` обмежує запуск,
+> повторний запуск продовжує з місця зупинки.
+
+> `sync` створює YAML-заготовку з назвою, тому звичайний `run` вважає метадані готовими й **не
+> кличе LLM**. Для опису, тегів і глав потрібен `--force-describe` (ручні `privacy`, `mode`,
+> `background` при цьому зберігаються). `--limit N` обробляє перші N задач за id; перерваний
+> прогін продовжується з того самого місця — просто запустіть команду ще раз.
 
 > `run` і `watch` беруть **усю** чергу. Для 200 задач це дні безперервного CPU — для потоку
 > використовуйте демон.
@@ -234,6 +253,13 @@ audiotube upload $ID && audiotube publish $ID
 
 # розібрати весь беклог у межах квоти
 audiotube run && audiotube daemon --once --max 4
+
+# нічний прогін беклогу: метадані LLM + відео, по 10 задач за запуск
+# (перервали/вимкнули — вранці та сама команда продовжить з місця зупинки)
+nohup nice -n 10 .venv/bin/audiotube run --force-describe --limit 10 \
+  >> data/nightly-$(date +%F).log 2>&1 &
+tail -f data/nightly-$(date +%F).log
+audiotube status
 
 # перегенерувати метадані для задач, де вже є транскрипт
 for id in $(audiotube status | awk '/описано|відрендерено/ {print $1}'); do
