@@ -7,6 +7,7 @@
 - Концепція і план розвитку: [docs/01_CONCEPT.md](docs/01_CONCEPT.md)
 - План інтеграції з NotebookLM (синхронізація аудіопереказів → папки → автопублікація): [docs/05_NOTEBOOKLM_PLAN.md](docs/05_NOTEBOOKLM_PLAN.md)
 - Автоматика (демон, systemd, квота): [docs/06_AUTOMATION.md](docs/06_AUTOMATION.md)
+- Довідник команд: [docs/07_COMMANDS.md](docs/07_COMMANDS.md)
 - Аналіз коду, рішення й наступні етапи: [docs/03_ANALYSIS_AND_NEXT_STEPS.md](docs/03_ANALYSIS_AND_NEXT_STEPS.md)
 - Налаштування транскрипції та LLM: [docs/04_LLM_AND_WHISPER.md](docs/04_LLM_AND_WHISPER.md)
 - Налаштування доступу до YouTube: [docs/02_YOUTUBE_SETUP.md](docs/02_YOUTUBE_SETUP.md)
@@ -72,6 +73,9 @@ audiotube auth
 # 7. Завантаження + обкладинка + субтитри + плейлист
 audiotube upload
 
+# 8. Зробити відео публічним (типово завантажується приватним)
+audiotube publish <id>
+
 audiotube status
 ```
 
@@ -90,6 +94,11 @@ audiotube web --port 9000 --open
 Черга задач, прев'ю відео, кнопки «Транскрипт / Метадані LLM / Рендер / Опублікувати»,
 редагування YAML-метаданих із валідацією перед збереженням. Працює локально, без зовнішніх
 залежностей; кожна дія виконується у своєму з'єднанні SQLite.
+
+Зверху — лічильники: скільки задач, скільки вже на YouTube, скільки готових до публікації,
+скільки аудіо в `inbox/` поза чергою і скільки `.mp4` у `output/`. Нижче — фільтри за статусом
+і пошук за назвою/файлом. Для відео, що вже на YouTube, є вибір приватності й кнопка
+«Змінити приватність» (те саме, що `audiotube publish`).
 
 Сторінка **«Ноутбуки»** (`/notebooks`) показує ланцюжок NotebookLM → переказ → відео: лічильники
 «скачано / у черзі / опубліковано / помилки / зникли» по кожному ноутбуку, перекази зі статусом задачі
@@ -242,7 +251,7 @@ new → transcribed → described → rendered → uploaded → done
 ## Тести
 
 ```bash
-python -m unittest discover -s tests          # 113 тестів
+python -m pytest -q                            # 169 тестів (або unittest discover -s tests)
 ```
 
 Тести, що потребують FFmpeg, автоматично пропускаються, якщо його немає в `PATH`.
@@ -252,7 +261,7 @@ python -m unittest discover -s tests          # 113 тестів
 
 ```
 audiotube/
-  cli.py         команди (transcribe, describe, render, web, watch, doctor, …)
+  cli.py         команди (transcribe, describe, render, publish, web, watch, doctor, …)
   pipeline.py    оркестратор і статуси
   transcript.py  модель транскрипту, SRT
   transcribe.py  бекенди транскрипції
@@ -268,7 +277,7 @@ audiotube/
   daemon.py      автоматичний цикл: бюджет, повтори, лок, очищення
   notify.py      сповіщення демона: Telegram / notify-send
   db.py          SQLite (data/audiotube.db)
-tests/           161 тест; синк, демон і публікація — без мережі й FFmpeg
+tests/           169 тестів; синк, демон і публікація — без мережі й FFmpeg
 deploy/systemd/  готові unit-файли для автозапуску
 docs/            концепція, аудит, інструкції
 ```

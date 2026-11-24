@@ -40,6 +40,8 @@ CLI: `auth`, `upload`, `captions`, `playlists`. Конфіг: `youtube:`.
 | YT-AC2 | **Given** `manage_playlists: true` **Then** відео додано в плейлист | `test_publish_playlist.py::test_playlist_enabled_still_works` |
 | YT-AC3 | повторна публікація не дублює відео | `test_pipeline.py::test_render_and_publish_idempotent` |
 | YT-AC4 | субтитри завантажуються з транскрипту | `test_pipeline_steps.py::test_full_chain_and_captions` |
+| YT-AC5 | **Given** у каналу кілька сторінок плейлистів **When** `playlists` **Then** повернуто всі | `test_youtube_playlists.py::test_collects_all_pages` |
+| YT-AC6 | **Given** плейлист з такою назвою вже є **Then** він переюзується, новий не створюється | `test_youtube_playlists.py::test_ensure_playlist_reuses_existing` |
 
 ## 8. Відповідність конституції
 

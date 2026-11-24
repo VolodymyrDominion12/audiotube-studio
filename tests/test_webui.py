@@ -2,6 +2,7 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -343,6 +344,155 @@ class NotebooksWebTests(unittest.TestCase):
         self.assertIn("Ноутбуки", body.decode("utf-8"))
         _, body, _ = self.request("/")
         self.assertIn('href="/notebooks"', body.decode("utf-8"))
+
+
+class FakeYT:
+    """Мінімальний фейк YouTube для publish (spec 011)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def list(self, **kw):
+        self.calls.append(("list", kw))
+        return _Req({"items": [{"id": kw["id"], "status": {
+            "privacyStatus": "private", "license": "youtube", "embeddable": True,
+            "publicStatsViewable": True, "selfDeclaredMadeForKids": False}}]})
+
+    def update(self, **kw):
+        self.calls.append(("update", kw))
+        return _Req({"id": kw["body"]["id"]})
+
+
+class _Req:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def execute(self):
+        return self.payload
+
+
+class FakeService:
+    def __init__(self):
+        self.vid = FakeYT()
+
+    def videos(self):
+        return self.vid
+
+
+class WebUIPublishTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "config.yaml").write_text(
+            "youtube:\n  daily_quota: 10000\n  contains_synthetic_media: true\n", encoding="utf-8"
+        )
+        self.cfg = load_config(root=self.tmp)
+        self.cfg.ensure_dirs()
+        self.app = WebApp(self.cfg, "127.0.0.1", 0)
+        self.server = make_server(self.app)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def request(self, path, method="GET", data=None):
+        body = json.dumps(data).encode("utf-8") if data is not None else None
+        req = urllib.request.Request(
+            self.base + path, data=body, method=method,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, e.read()
+            finally:
+                e.close()
+
+    def state(self):
+        status, body = self.request("/api/state")
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+    def add_job(self, slug, status="new", video_id=None, audio=True):
+        with Database(self.cfg.db_path) as db:
+            path = self.cfg.inbox / f"{slug}.mp3"
+            if audio:
+                path.write_bytes(b"audio")
+            job = db.add_job(path, slug, title=slug)
+            db.update(job.id, status=status, video_id=video_id)
+            return job.id
+
+    def test_publish_changes_privacy(self):
+        """WEB2-AC1: publish з UI змінює приватність і списує квоту."""
+        job_id = self.add_job("ep", status="uploaded", video_id="vid1")
+        fake = FakeService()
+        with mock.patch("audiotube.youtube.build_service", return_value=fake):
+            status, body = self.request(f"/api/jobs/{job_id}/publish?privacy=public", method="POST", data={})
+        self.assertEqual(status, 200, body)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertIn("youtu.be/vid1", data["message"])
+        self.assertIn("update", [c[0] for c in fake.vid.calls])
+        self.assertEqual(self.state()["quota"]["used"], 51)
+
+    def test_publish_requires_upload(self):
+        """WEB2-AC2: без video_id — 400 і жодного виклику YouTube."""
+        job_id = self.add_job("ep")
+        fake = FakeService()
+        with mock.patch("audiotube.youtube.build_service", return_value=fake):
+            status, body = self.request(f"/api/jobs/{job_id}/publish", method="POST", data={})
+        self.assertEqual(status, 400)
+        self.assertIn("upload", json.loads(body)["message"])
+        self.assertEqual(fake.vid.calls, [])
+
+    def test_publish_rejects_bad_privacy(self):
+        """WEB2-AC3: невідома приватність — 400, без виклику API."""
+        job_id = self.add_job("ep", status="uploaded", video_id="vid1")
+        fake = FakeService()
+        with mock.patch("audiotube.youtube.build_service", return_value=fake):
+            status, body = self.request(f"/api/jobs/{job_id}/publish?privacy=secret", method="POST", data={})
+        self.assertEqual(status, 400)
+        self.assertIn("приватність", json.loads(body)["message"])
+        self.assertEqual(fake.vid.calls, [])
+
+    def test_state_counts(self):
+        """WEB2-AC4: counts рахує статуси, опубліковані й готові до публікації."""
+        self.add_job("a", status="new")
+        self.add_job("b", status="rendered")
+        self.add_job("c", status="uploaded", video_id="vid3")
+        counts = self.state()["counts"]
+        self.assertEqual(counts["total"], 3)
+        self.assertEqual(counts["published"], 1)
+        self.assertEqual(counts["ready_to_publish"], 1)
+        self.assertEqual(counts["by_status"]["new"], 1)
+        self.assertEqual(counts["by_status"]["done"], 0)
+
+    def test_state_files(self):
+        """WEB2-AC5: files рахує аудіо в inbox і незареєстровані."""
+        self.add_job("registered", status="new")
+        (self.cfg.inbox / "extra.mp3").write_bytes(b"audio")
+        (self.cfg.inbox / "notes.txt").write_text("x", encoding="utf-8")
+        (self.cfg.output / "ep.mp4").write_bytes(b"v")
+        (self.cfg.output / "ep.mp4.part").write_bytes(b"v")
+        files = self.state()["files"]
+        self.assertEqual(files["inbox_audio"], 2)
+        self.assertEqual(files["inbox_unregistered"], 1)
+        self.assertEqual(files["output_videos"], 1)
+
+    def test_index_has_filters_and_publish(self):
+        """WEB2-AC6: головна сторінка містить фільтри й керування приватністю."""
+        status, body = self.request("/")
+        self.assertEqual(status, 200)
+        html = body.decode("utf-8")
+        for marker in ('id="q"', 'id="st"', "privacy", "counts"):
+            self.assertIn(marker, html)
 
 
 if __name__ == "__main__":

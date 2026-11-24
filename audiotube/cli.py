@@ -289,6 +289,50 @@ def cmd_captions(args) -> int:
     return 1
 
 
+def cmd_publish(args) -> int:
+    from audiotube.pipeline import Pipeline as _Pipeline
+    from audiotube.youtube import Publisher, QuotaExceeded, build_service
+
+    cfg = _cfg(args)
+    pipe = _Pipeline(cfg)
+    jobs, failed = [], 0
+    for raw in args.ids:
+        job = pipe.db.get(raw)
+        if not job:
+            print(f"задачу {raw} не знайдено")
+            failed += 1
+            continue
+        if not job.video_id:
+            print(f"[{job.id}] відео ще не завантажено на YouTube (спершу upload)")
+            failed += 1
+            continue
+        jobs.append(job)
+
+    if not jobs:
+        return 1
+
+    if args.dry_run:
+        for job in jobs:
+            print(f"[{job.id}] {job.video_id}: {args.privacy} (dry-run, нічого не змінено)")
+        return 1 if failed else 0
+
+    pub = Publisher(build_service(cfg, interactive=False), cfg, pipe.quota)
+    for job in jobs:
+        try:
+            privacy = pub.set_privacy(job.video_id, args.privacy)
+        except QuotaExceeded as e:
+            print(f"! {e}")
+            failed += 1
+            break
+        except Exception as e:  # noqa: BLE001 — одна помилка не зупиняє решту
+            print(f"! [{job.id}] {e}")
+            failed += 1
+            continue
+        print(f"[{job.id}] {job.title or job.slug}: {privacy} → {job.url}")
+    print(f"квота сьогодні: {pipe.quota.used()} / {pipe.quota.daily_limit}")
+    return 1 if failed else 0
+
+
 def _has_transcript(pipe: Pipeline, job) -> bool:
     from audiotube.transcribe import TRANSCRIPT_NAME
 
@@ -628,6 +672,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("captions", help="додати субтитри до вже завантаженого відео")
     s.add_argument("id", type=int)
     s.set_defaults(func=cmd_captions)
+
+    s = sub.add_parser("publish", help="змінити приватність завантаженого відео")
+    s.add_argument("ids", nargs="+", type=int)
+    s.add_argument("--privacy", choices=("public", "unlisted", "private"), default="public")
+    s.add_argument("--dry-run", action="store_true", help="лише показати, нічого не змінювати")
+    s.set_defaults(func=cmd_publish)
 
     s = sub.add_parser("run", help="scan + transcribe + describe + render (+ upload)")
     s.add_argument("--upload", action="store_true", help="завантажити навіть якщо auto_upload вимкнено")

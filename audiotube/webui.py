@@ -18,17 +18,18 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import yaml
 
+from audiotube import AUDIO_EXTENSIONS
 from audiotube.config import Config
 from audiotube.daemon import daemon_lock, next_upload_at
 from audiotube.db import Database, Job, QuotaTracker
 from audiotube.media import has_ffmpeg
 from audiotube.metadata import MetadataError, VideoMeta, dump_sidecar, load_meta, sidecar_path
 from audiotube.notebooklm import Adapter
-from audiotube.pipeline import Pipeline
+from audiotube.pipeline import STATUS_ORDER, Pipeline
 from audiotube.sync import SyncReport, SyncService
 
 MAX_BODY = 1_000_000
@@ -77,6 +78,20 @@ def job_json(cfg: Config, job: Job) -> dict:
     }
 
 
+def disk_stats(cfg: Config, jobs: list[Job]) -> dict:
+    """WEB2-R4: скільки аудіо лежить на диску і скільки з них поза чергою."""
+    registered = {job.audio.resolve() for job in jobs}
+    inbox_audio = [
+        p for p in cfg.inbox.rglob("*")
+        if p.is_file() and not p.name.startswith(".") and p.suffix.lower() in AUDIO_EXTENSIONS
+    ]
+    return {
+        "inbox_audio": len(inbox_audio),
+        "inbox_unregistered": sum(1 for p in inbox_audio if p.resolve() not in registered),
+        "output_videos": sum(1 for p in cfg.output.glob("*.mp4") if p.is_file()),
+    }
+
+
 def _yaml_for(cfg: Config, job: Job) -> str:
     side = sidecar_path(job.audio)
     if side.exists():
@@ -118,13 +133,25 @@ class WebApp:
         with self.lock:
             pipe = Pipeline(self.cfg, log=lambda *_: None)
             try:
-                jobs = [job_json(self.cfg, j) for j in pipe.db.list()]
+                rows = pipe.db.list()
+                jobs = [job_json(self.cfg, j) for j in rows]
                 used = pipe.quota.used()
                 limit = pipe.quota.daily_limit
+                files = disk_stats(self.cfg, rows)
             finally:
                 pipe.db.close()
+        by_status = {status: 0 for status in STATUS_ORDER}
+        for row in rows:
+            by_status[row.status] = by_status.get(row.status, 0) + 1
         return {
             "jobs": jobs,
+            "counts": {
+                "total": len(rows),
+                "by_status": by_status,
+                "published": sum(1 for row in rows if row.video_id),
+                "ready_to_publish": by_status.get("rendered", 0),
+            },
+            "files": files,
             "quota": {"used": used, "limit": limit},
             "config": {
                 "llm": f"{self.cfg.llm.provider}/{self.cfg.llm.model}",
@@ -137,7 +164,7 @@ class WebApp:
         }
 
     # --- дії -----------------------------------------------------------------
-    def action(self, job_id: int, action: str, force: bool = False) -> dict:
+    def action(self, job_id: int, action: str, force: bool = False, privacy: str = "public") -> dict:
         logs: list[str] = []
         with self.lock:
             pipe = Pipeline(self.cfg, log=logs.append, interactive=False)
@@ -155,6 +182,17 @@ class WebApp:
                     job = pipe.render(job, preview=PREVIEW_SECONDS, force=True)
                 elif action == "upload":
                     job = pipe.publish(job)
+                elif action == "publish":
+                    if not job.video_id:
+                        raise WebError("відео ще не завантажено на YouTube (спершу upload)")
+                    from audiotube.youtube import PRIVACY_VALUES, Publisher, build_service
+
+                    if privacy not in PRIVACY_VALUES:
+                        raise WebError(f"некоректна приватність: {privacy}")
+                    Publisher(
+                        build_service(self.cfg, interactive=False), self.cfg, pipe.quota
+                    ).set_privacy(job.video_id, privacy)
+                    logs.append(f"приватність {privacy}: {job.url}")
                 elif action == "reset":
                     job = pipe.db.update(job.id, status="new", error=None, attempts=0)
                 else:
@@ -444,8 +482,13 @@ class _Handler(BaseHTTPRequestHandler):
                 dry_run = "dry_run=1" in (urlparse(self.path).query or "")
                 self._json(200, self.app.sync(dry_run=dry_run))
             elif len(parts) == 4 and parts[:2] == ["api", "jobs"]:
-                force = "force=1" in (urlparse(self.path).query or "")
-                self._json(200, self.app.action(int(parts[2]), parts[3], force=force))
+                query = parse_qs(urlparse(self.path).query)
+                force = query.get("force", ["0"])[0] in ("1", "true")
+                privacy = query.get("privacy", ["public"])[0]
+                self._json(
+                    200,
+                    self.app.action(int(parts[2]), parts[3], force=force, privacy=privacy),
+                )
             else:
                 self._error(404, "немає такого маршруту")
         except Busy as e:
@@ -562,6 +605,12 @@ HTML = r"""<!doctype html>
           border-radius:50%; animation:sp 0.8s linear infinite; margin-right:12px; }
   @keyframes sp { to { transform:rotate(360deg); } }
   .hint { color:var(--muted); font-size:12px; }
+  .filters { display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap; }
+  .filters input, .filters select { background:var(--panel2); color:var(--text); border:1px solid var(--line);
+           border-radius:8px; padding:8px 11px; font:inherit; font-size:14px; }
+  .filters input { flex:1; min-width:220px; }
+  select.privacy { background:var(--panel2); color:var(--text); border:1px solid var(--line);
+           border-radius:8px; padding:7px 10px; font:inherit; font-size:13px; }
 </style>
 </head>
 <body>
@@ -569,12 +618,25 @@ HTML = r"""<!doctype html>
   <h1>AudioTube Studio</h1>
   <span class="pill" id="quota">квота: …</span>
   <span class="pill" id="cfg">…</span>
+  <span class="pill" id="counts">…</span>
   <span class="spacer"></span>
   <a class="navlink" href="/notebooks">Ноутбуки</a>
   <button class="ghost" id="toggle-log">Журнал</button>
   <button class="primary" id="scan">Сканувати inbox</button>
 </header>
 <main>
+  <div class="filters">
+    <input id="q" type="search" placeholder="пошук за назвою, файлом або slug" oninput="render()">
+    <select id="st" onchange="render()">
+      <option value="">усі статуси</option>
+      <option value="new">нове</option>
+      <option value="transcribed">транскрипт</option>
+      <option value="described">метадані</option>
+      <option value="rendered">відрендерено</option>
+      <option value="uploaded">на YouTube</option>
+      <option value="done">готово</option>
+    </select>
+  </div>
   <div id="jobs"><div class="empty">Завантаження…</div></div>
 </main>
 <div id="log"></div>
@@ -597,7 +659,7 @@ HTML = r"""<!doctype html>
 <script>
 const UA = {new:"нове", transcribed:"транскрипт", described:"метадані", rendered:"відрендерено",
             uploaded:"на YouTube", done:"готово"};
-let state = {jobs: [], quota: {used: 0, limit: 0}, config: {}};
+let state = {jobs: [], quota: {used: 0, limit: 0}, config: {}, counts: {}, files: {}};
 let busyCount = 0;
 
 function setBusy(on, text) {
@@ -630,17 +692,37 @@ function refresh() {
     document.getElementById("jobs").innerHTML = `<div class="empty">Помилка: ${esc(e.message)}</div>`;
   });
 }
+function renderCounts() {
+  const c = state.counts || {total: state.jobs.length, published: 0, ready_to_publish: 0};
+  const f = state.files || {inbox_audio: 0, inbox_unregistered: 0, output_videos: 0};
+  document.getElementById("counts").textContent =
+    `${c.total} задач · на YouTube ${c.published} · готових ${c.ready_to_publish} · ` +
+    `inbox ${f.inbox_audio} (поза чергою ${f.inbox_unregistered}) · mp4 ${f.output_videos}`;
+}
+function visibleJobs() {
+  const q = (document.getElementById("q").value || "").trim().toLowerCase();
+  const st = document.getElementById("st").value;
+  return state.jobs.filter(j =>
+    (!st || j.status === st) &&
+    (!q || `${j.title} ${j.audio} ${j.slug}`.toLowerCase().includes(q)));
+}
 function render() {
   document.getElementById("quota").textContent = `квота: ${state.quota.used} / ${state.quota.limit}`;
   const c = state.config;
   document.getElementById("cfg").textContent =
     `${c.llm} · ${c.transcribe} · ffmpeg: ${c.ffmpeg ? "ok" : "немає"}`;
+  renderCounts();
   const box = document.getElementById("jobs");
   if (!state.jobs.length) {
     box.innerHTML = `<div class="empty">Порожньо. Покладіть аудіо в <b>inbox/</b> і натисніть «Сканувати inbox».</div>`;
     return;
   }
-  box.innerHTML = state.jobs.map(j => {
+  const jobs = visibleJobs();
+  if (!jobs.length) {
+    box.innerHTML = `<div class="empty">Нічого не знайдено за фільтром.</div>`;
+    return;
+  }
+  box.innerHTML = jobs.map(j => {
     const badge = `<span class="badge ${j.status}">${UA[j.status] || j.status}</span>`;
     const yt = j.url ? ` · <a href="${j.url}" target="_blank" style="color:var(--accent)">${j.url}</a>` : "";
     const flags = [j.has_transcript ? "текст" : "", j.subtitles ? "srt" : "", j.captions ? "субтитри YT" : "",
@@ -659,7 +741,14 @@ function render() {
         <button class="ghost" onclick="editMeta(${j.id})">Редагувати</button>
         <button class="ghost" onclick="act(${j.id},'preview')">Прев'ю 20с</button>
         <button onclick="act(${j.id},'render')">Рендер</button>
-        <button class="primary" onclick="act(${j.id},'upload')">Опублікувати</button>
+        ${j.url
+          ? `<select class="privacy" id="privacy-${j.id}">
+               <option value="public">public</option>
+               <option value="unlisted">unlisted</option>
+               <option value="private">private</option>
+             </select>
+             <button onclick="publishJob(${j.id})">Змінити приватність</button>`
+          : `<button class="primary" onclick="act(${j.id},'upload')">Опублікувати</button>`}
         <button class="ghost" onclick="act(${j.id},'reset')">Скинути</button>
       </div>
     </div>`;
@@ -671,6 +760,20 @@ async function act(id, action, force = false) {
               : action === "upload" ? "завантаження на YouTube…" : "працюю…");
   try {
     const data = await api(`/api/jobs/${id}/${action}${force ? "?force=1" : ""}`, {method: "POST"});
+    setLog(data.log && data.log.length ? data.log : [data.message]);
+  } catch (e) {
+    setLog([`Помилка: ${e.message}`]);
+  } finally {
+    setBusy(false);
+    await refresh();
+  }
+}
+async function publishJob(id) {
+  const sel = document.getElementById(`privacy-${id}`);
+  const privacy = sel ? sel.value : "public";
+  setBusy(true, `зміна приватності → ${privacy}…`);
+  try {
+    const data = await api(`/api/jobs/${id}/publish?privacy=${encodeURIComponent(privacy)}`, {method: "POST"});
     setLog(data.log && data.log.length ? data.log : [data.message]);
   } catch (e) {
     setLog([`Помилка: ${e.message}`]);

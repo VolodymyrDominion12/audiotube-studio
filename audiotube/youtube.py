@@ -23,6 +23,7 @@ COST_WRITE = 50
 COST_READ = 1
 COST_CAPTION = 400
 RETRIABLE_STATUS = {500, 502, 503, 504}
+PRIVACY_VALUES = ("public", "unlisted", "private")
 
 
 class YouTubeError(RuntimeError):
@@ -195,7 +196,31 @@ class Publisher:
                 return None
             raise
 
-    # --- плейлисти -------------------------------------------------------------    def list_playlists(self) -> list[dict]:
+    # --- приватність -----------------------------------------------------------
+    def set_privacy(self, video_id: str, privacy: str) -> str:
+        """Змінює приватність наявного відео, зберігаючи решту полів status (spec 010)."""
+        if privacy not in PRIVACY_VALUES:
+            raise YouTubeError(f"невідома приватність: {privacy}")
+        self._spend(COST_READ, "поточний статус відео")
+        items = self.yt.videos().list(part="status", id=video_id).execute().get("items", [])
+        if not items:
+            raise YouTubeError(f"відео {video_id} не знайдено на каналі")
+        current = items[0].get("status", {})
+        self._spend(COST_WRITE, "зміна приватності відео")
+        status = {
+            "privacyStatus": privacy,
+            "license": current.get("license", "youtube"),
+            "embeddable": current.get("embeddable", True),
+            "publicStatsViewable": current.get("publicStatsViewable", True),
+            "selfDeclaredMadeForKids": current.get("selfDeclaredMadeForKids", False),
+            "containsSyntheticMedia": self.cfg.youtube.contains_synthetic_media,
+        }
+        # publishAt не переносимо: ручна зміна приватності скасовує відкладений вихід
+        self.yt.videos().update(part="status", body={"id": video_id, "status": status}).execute()
+        return privacy
+
+    # --- плейлисти -------------------------------------------------------------
+    def list_playlists(self) -> list[dict]:
         items, token = [], None
         while True:
             self._spend(COST_READ, "список плейлистів")
