@@ -27,7 +27,41 @@ CREATE TABLE quota (day TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0);
 """
 
 
+OLD_ARTIFACTS_SCHEMA = """
+CREATE TABLE artifacts (
+    id TEXT PRIMARY KEY,
+    notebook_id TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'audio',
+    title TEXT,
+    created_at TEXT,
+    duration REAL,
+    path TEXT,
+    sha256 TEXT,
+    bytes INTEGER,
+    state TEXT NOT NULL DEFAULT 'downloaded',
+    job_id INTEGER,
+    downloaded_at TEXT
+);
+INSERT INTO artifacts (id, notebook_id, path) VALUES ('a1', 'nb1', '/tmp/a1.m4a');
+"""
+
+
 class DatabaseTests(unittest.TestCase):
+    def test_migration_adds_artifact_audio_deleted(self):
+        """FILE-AC10: стара база без artifacts.audio_deleted отримує колонку зі значенням 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.db"
+            conn = sqlite3.connect(path)
+            conn.executescript(OLD_ARTIFACTS_SCHEMA)
+            conn.commit()
+            conn.close()
+
+            db = Database(path)
+            row = db.artifact("a1")
+            db.close()
+
+        self.assertEqual(row["audio_deleted"], 0)
+
     def test_migration_adds_new_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "old.db"

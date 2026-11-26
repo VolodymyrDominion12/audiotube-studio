@@ -203,8 +203,11 @@ audiotube web --port 9000 --open    # інший порт і одразу від
 ```
 
 Локальна сторінка без збірки й залежностей: лічильники (задачі, на YouTube, готові до публікації,
-аудіо в `inbox/` поза чергою, `.mp4` у `output/`), фільтр за статусом і пошук, картки задач із
-прев'ю, кнопки кроків, редагування YAML і зміна приватності вже завантажених відео. Сторінка
+аудіо в `inbox/` поза чергою, `.mp4` у `output/`, сумарні розміри аудіо й відео), фільтр за
+статусом і пошук, картки задач із прев'ю, кнопки кроків, редагування YAML і зміна приватності
+вже завантажених відео. Кнопки «Видалити аудіо» / «Видалити відео» звільняють місце, зберігаючи
+історію: аудіо позначається в БД (`artifacts.audio_deleted`) і `sync` не качає його повторно,
+а `video_id` та посилання на YouTube лишаються; «Відновити аудіо» знімає позначку. Сторінка
 `/notebooks` — синк і статистика по ноутбуках. Той самий сервер віддає API:
 
 ```
@@ -212,6 +215,7 @@ GET  /api/state                                   # задачі, квота, co
 POST /api/scan
 POST /api/sync?dry_run=1
 POST /api/jobs/<id>/{transcribe,describe,render,preview,upload,reset}
+POST /api/jobs/<id>/{delete_audio,delete_video,restore_audio}
 POST /api/jobs/<id>/publish?privacy=public
 GET/PUT /api/jobs/<id>/meta
 GET  /api/notebooks, /api/daemon

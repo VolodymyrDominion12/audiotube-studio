@@ -241,10 +241,14 @@ class Daemon:
             )
             return stats
 
+        # spec 014: незавершеній задачі без аудіо нема чим допомогти — не палимо спроби.
+        # Уже відрендерене відео без аудіо ще можна опублікувати, тому його лишаємо.
+        audio_deleted = self.pipe.db.audio_deleted_job_ids()
         jobs = [
             j
             for j in self.pipe.db.list(READY_STATUSES)
             if j.attempts < cfg.daemon.max_attempts
+            and not (j.id in audio_deleted and STATUS_ORDER[j.status] < STATUS_ORDER["rendered"])
         ]
         if cfg.daemon.order == "newest":
             jobs.reverse()

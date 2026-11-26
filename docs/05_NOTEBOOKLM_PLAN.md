@@ -381,12 +381,18 @@ CREATE TABLE artifacts (
     bytes        INTEGER,
     state        TEXT NOT NULL,          -- new / downloaded / missing / superseded
     job_id       INTEGER REFERENCES jobs(id),
-    downloaded_at TEXT
+    downloaded_at TEXT,
+    audio_deleted INTEGER NOT NULL DEFAULT 0  -- локальне аудіо прибрали вручну (spec 014)
 );
 ```
 
 `jobs.audio` уже `UNIQUE`, тож повторна реєстрація того самого шляху нічого не дублює. Зв'язок
 `artifacts.job_id` дає змогу показати в GUI: «ноутбук → артефакт → відео на YouTube».
+
+`audio_deleted=1` означає, що файл видалили з `inbox/` через веб-UI, щоб звільнити місце.
+Рядок артефакту, `sha256`, `bytes` і `downloaded_at` лишаються, тому `sync` не качає його
+повторно (навіть `--force`), а «Відновити аудіо» просто знімає прапорець. `state` при цьому
+й далі описує наявність переказу в NotebookLM — це ортогональні речі.
 
 Додатково для демона: таблиця `uploads` (фактичні публікації — денний бюджет і `min_hours_between`)
 і колонка `jobs.attempts` (після `max_attempts` задача заморожується, а не циклить вічно).

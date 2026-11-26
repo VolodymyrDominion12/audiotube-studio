@@ -53,6 +53,7 @@ draft → approved → in-progress → implemented
 | 011 | [Веб-інтерфейс: публікація, лічильники, фільтри](011-webui-publish-filters/spec.md) | implemented | `webui.py` |
 | 012 | [Нічний пакетний прогін](012-nightly-run/spec.md) | implemented | `cli.py`, `pipeline.py` |
 | 013 | [Дорендер аудіо без відео](013-missing-video-render/spec.md) | implemented | `cli.py` |
+| 014 | [Локальне очищення аудіо та відео](014-local-file-cleanup/spec.md) | implemented | `webui.py`, `db.py`, `sync.py` |
 
 Спеки 001–004 написані **після** коду (reverse-engineered): вони фіксують поточну поведінку
 як контракт, щоб подальші зміни не ламали її непомітно.

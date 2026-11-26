@@ -65,6 +65,7 @@ class SyncReport:
     missing: int = 0  # зникли з NotebookLM у цьому прогоні (файли лишаються)
     restored: int = 0  # були missing і знову з'явилися
     changed: int = 0  # --force: той самий id, інший вміст (версії ще не підтримуються)
+    deleted: int = 0  # локальне аудіо свідомо видалено — не качаємо (spec 014)
     errors: list[str] = field(default_factory=list)
     items: list[SyncItem] = field(default_factory=list)
 
@@ -217,6 +218,18 @@ class SyncService:
             report.skipped += 1
             report.items.append(
                 SyncItem("skip", nb.title, title, existing, art.id, f"ще генерується ({art.status})")
+            )
+            return
+
+        if row and row["audio_deleted"]:
+            # spec 014: аудіо прибрали з диска свідомо; історія в БД лишається,
+            # тому навіть --force і repair_missing не мають його качати.
+            report.deleted += 1
+            report.items.append(
+                SyncItem(
+                    "deleted", nb.title, title, existing, art.id,
+                    "аудіо видалено локально — не качаємо повторно",
+                )
             )
             return
 

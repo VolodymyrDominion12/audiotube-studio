@@ -57,8 +57,45 @@ def _rel(cfg: Config, path: Path | None) -> str | None:
         return None
 
 
-def job_json(cfg: Config, job: Job) -> dict:
+def _size(path: Path | None) -> int | None:
+    if not path:
+        return None
+    try:
+        return path.stat().st_size if path.is_file() else None
+    except OSError:
+        return None
+
+
+def _human_size(size: int) -> str:
+    value = float(size)
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if value < 1024 or unit == "ТБ":
+            return f"{value:.0f} {unit}" if unit == "Б" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} ТБ"
+
+
+def _ensure_managed(path: Path, base: Path, label: str) -> None:
+    """spec 014: видаляємо лише те, що лежить у керованій теці."""
+    if not _is_under(path.resolve(), base.resolve()):
+        raise WebError(f"{label} поза {base.name}/: {path} — видалення заборонено")
+
+
+def _unlink_file(path: Path, base: Path, label: str) -> int:
+    """Видаляє файл у межах base; повертає звільнені байти (0, якщо файлу немає)."""
+    _ensure_managed(path, base, label)
+    if not path.exists():
+        return 0
+    if not path.is_file():
+        raise WebError(f"{label} не є файлом: {path}")
+    size = path.stat().st_size
+    path.unlink()
+    return size
+
+
+def job_json(cfg: Config, job: Job, *, audio_deleted: bool = False) -> dict:
     preview = cfg.output / f"{job.slug}_preview.mp4"
+    video = job.video
     return {
         "id": job.id,
         "slug": job.slug,
@@ -68,13 +105,19 @@ def job_json(cfg: Config, job: Job) -> dict:
         "duration": job.duration,
         "error": job.error,
         "url": job.url,
-        "video": _rel(cfg, job.video),
+        "video": _rel(cfg, video),
         "thumbnail": _rel(cfg, job.thumbnail),
         "preview": _rel(cfg, preview if preview.exists() else None),
         "subtitles": _rel(cfg, job.subtitles),
         "captions": bool(job.captions_id),
         "playlist": bool(job.playlist_id),
         "has_transcript": bool(job.transcript and job.transcript.exists()),
+        # spec 014: керування локальними файлами
+        "audio_exists": job.audio.is_file(),
+        "audio_size": _size(job.audio),
+        "audio_deleted": bool(audio_deleted),
+        "video_exists": bool(video and video.is_file()),
+        "video_size": _size(video),
     }
 
 
@@ -85,10 +128,13 @@ def disk_stats(cfg: Config, jobs: list[Job]) -> dict:
         p for p in cfg.inbox.rglob("*")
         if p.is_file() and not p.name.startswith(".") and p.suffix.lower() in AUDIO_EXTENSIONS
     ]
+    output_videos = [p for p in cfg.output.glob("*.mp4") if p.is_file()]
     return {
         "inbox_audio": len(inbox_audio),
         "inbox_unregistered": sum(1 for p in inbox_audio if p.resolve() not in registered),
-        "output_videos": sum(1 for p in cfg.output.glob("*.mp4") if p.is_file()),
+        "inbox_bytes": sum(_size(p) or 0 for p in inbox_audio),
+        "output_videos": len(output_videos),
+        "output_bytes": sum(_size(p) or 0 for p in output_videos),
     }
 
 
@@ -134,7 +180,8 @@ class WebApp:
             pipe = Pipeline(self.cfg, log=lambda *_: None)
             try:
                 rows = pipe.db.list()
-                jobs = [job_json(self.cfg, j) for j in rows]
+                deleted = pipe.db.audio_deleted_job_ids()
+                jobs = [job_json(self.cfg, j, audio_deleted=j.id in deleted) for j in rows]
                 used = pipe.quota.used()
                 limit = pipe.quota.daily_limit
                 files = disk_stats(self.cfg, rows)
@@ -195,15 +242,88 @@ class WebApp:
                     logs.append(f"приватність {privacy}: {job.url}")
                 elif action == "reset":
                     job = pipe.db.update(job.id, status="new", error=None, attempts=0)
+                elif action == "delete_audio":
+                    job = self._delete_audio(pipe, job, logs)
+                elif action == "restore_audio":
+                    job = self._restore_audio(pipe, job, logs)
+                elif action == "delete_video":
+                    job = self._delete_video(pipe, job, logs)
                 else:
                     raise WebError(f"невідома дія: {action}")
-                payload = {"job": job_json(self.cfg, job)}
+                deleted = pipe.db.audio_deleted_job_ids()
+                payload = {"job": job_json(self.cfg, job, audio_deleted=job.id in deleted)}
             finally:
                 pipe.db.close()
         payload["ok"] = True
         payload["log"] = logs
         payload["message"] = logs[-1] if logs else "готово"
         return payload
+
+    # --- локальні файли (spec 014) -------------------------------------------
+    def _delete_audio(self, pipe: Pipeline, job: Job, logs: list[str]) -> Job:
+        """Видаляє аудіофайл, лишаючи задачу, YAML і прапорець «уже скачано»."""
+        candidates = [job.audio, job.audio.with_name(job.audio.name + ".part")]
+        for path in candidates:
+            if path.exists():
+                _ensure_managed(path, self.cfg.inbox, "аудіо")
+        removed, freed = [], 0
+        for path in candidates:
+            if path.exists():
+                freed += _unlink_file(path, self.cfg.inbox, "аудіо")
+                removed.append(path.name)
+        if removed:
+            logs.append(f"[{job.id}] видалено аудіо: {', '.join(removed)} ({_human_size(freed)})")
+        else:
+            logs.append(f"[{job.id}] аудіо вже немає на диску")
+        marked = pipe.db.set_audio_deleted(job.id, job.audio, deleted=True)
+        if marked:
+            logs.append(f"[{job.id}] синк не качатиме його повторно (позначено артефактів: {marked})")
+        else:
+            logs.append(f"[{job.id}] артефакту NotebookLM немає — повторного завантаження не буде")
+        return pipe.db.get(job.id)
+
+    def _restore_audio(self, pipe: Pipeline, job: Job, logs: list[str]) -> Job:
+        """Знімає прапорець; саме завантаження робить наступний sync."""
+        if job.audio.exists():
+            logs.append(f"[{job.id}] аудіо вже на диску: {job.audio.name}")
+        marked = pipe.db.set_audio_deleted(job.id, job.audio, deleted=False)
+        if marked:
+            logs.append(f"[{job.id}] аудіо позначено для повторного завантаження; натисніть «Синк»")
+        elif job.audio.exists():
+            logs.append(f"[{job.id}] прапорець знято")
+        else:
+            logs.append(f"[{job.id}] немає артефакту NotebookLM — відновлювати нічого")
+        return pipe.db.get(job.id)
+
+    def _delete_video(self, pipe: Pipeline, job: Job, logs: list[str]) -> Job:
+        """Видаляє локальні mp4, лишаючи video_id і всю історію YouTube."""
+        candidates: list[Path] = []
+        if job.video:
+            candidates.append(job.video)
+        candidates.append(self.cfg.output / f"{job.slug}.mp4")
+        candidates.append(self.cfg.output / f"{job.slug}_preview.mp4")
+        unique: list[Path] = []
+        for path in candidates:
+            if path.resolve() not in {p.resolve() for p in unique}:
+                unique.append(path)
+        # спершу перевіряємо всі наявні файли, щоб не видалити частину й упасти
+        for path in unique:
+            if path.exists():
+                _ensure_managed(path, self.cfg.output, "відео")
+        removed, freed = [], 0
+        for path in unique:
+            if path.exists():
+                freed += _unlink_file(path, self.cfg.output, "відео")
+                removed.append(path.name)
+        if removed:
+            logs.append(f"[{job.id}] видалено відео: {', '.join(removed)} ({_human_size(freed)})")
+        else:
+            logs.append(f"[{job.id}] відео на диску вже немає")
+        if job.video_id:
+            logs.append(f"[{job.id}] на YouTube лишається: {job.url}")
+        else:
+            logs.append(f"[{job.id}] локальне відео можна відрендерити знову")
+        return pipe.db.update(job.id, video=None)
 
     def scan(self) -> dict:
         logs: list[str] = []
@@ -237,7 +357,11 @@ class WebApp:
                 save_meta_text(job, text)
                 meta = load_meta(job.audio)
                 pipe.db.update(job.id, title=meta.title, error=None)
-                return {"ok": True, "message": "метадані збережено", "job": job_json(self.cfg, job)}
+                deleted = pipe.db.audio_deleted_job_ids()
+                return {
+                    "ok": True, "message": "метадані збережено",
+                    "job": job_json(self.cfg, job, audio_deleted=job.id in deleted),
+                }
             finally:
                 pipe.db.close()
 
@@ -247,7 +371,7 @@ class WebApp:
         with Database(self.cfg.db_path) as db:
             rows = db.notebook_stats()
         keys = ("id", "title", "slug", "url", "sources", "synced_at",
-                "downloaded", "missing", "published", "errors", "queued")
+                "downloaded", "missing", "deleted", "published", "errors", "queued")
         return {"ok": True, "notebooks": [{k: r[k] for k in keys} for r in rows]}
 
     def notebook(self, notebook_id: str) -> dict:
@@ -267,6 +391,8 @@ class WebApp:
                 "job_id": r["job_id"],
                 "job_status": r["job_status"],
                 "attempts": r["attempts"],
+                "audio_deleted": bool(r["audio_deleted"]),
+                "audio_exists": bool(r["path"] and Path(r["path"]).is_file()),
                 "url": f"https://youtu.be/{r['video_id']}" if r["video_id"] else None,
                 "error": r["error"].splitlines()[0] if r["error"] else None,
             }
@@ -336,6 +462,7 @@ def report_json(report: SyncReport) -> dict:
         "missing": report.missing,
         "restored": report.restored,
         "changed": report.changed,
+        "deleted": report.deleted,
         "errors": list(report.errors),
         "items": [
             {"action": i.action, "notebook": i.notebook, "title": i.title, "message": i.message}
@@ -351,6 +478,8 @@ def _sync_summary(report: SyncReport, dry_run: bool) -> str:
         parts.append(f"зникли {report.missing}")
     if report.restored:
         parts.append(f"повернулися {report.restored}")
+    if report.deleted:
+        parts.append(f"видалено локально {report.deleted}")
     if report.errors:
         parts.append(f"помилок {len(report.errors)}")
     return ", ".join(parts)
@@ -565,6 +694,8 @@ HTML = r"""<!doctype html>
   button:hover { border-color:var(--accent); }
   button.primary { background:var(--accent); border-color:var(--accent); color:#06121f; font-weight:600; }
   button.ghost { background:transparent; }
+  button.danger { color:var(--err); }
+  button.danger:hover { border-color:var(--err); }
   button:disabled { opacity:.45; cursor:wait; }
   main { padding:18px 22px 60px; max-width:1100px; margin:0 auto; }
   .empty { color:var(--muted); padding:40px 0; text-align:center; }
@@ -581,6 +712,10 @@ HTML = r"""<!doctype html>
   .badge.done { background:#1d3f38; color:#5fe0c0; }
   .err { color:var(--err); font-size:13px; margin-top:8px; white-space:pre-wrap; }
   .actions { display:flex; gap:7px; flex-wrap:wrap; margin-top:12px; }
+  .files { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; padding-top:10px;
+           border-top:1px dashed var(--line); font-size:13px; }
+  .files .f { color:var(--muted); }
+  .files .gone { color:var(--warn); }
   .meta-box { display:flex; gap:14px; align-items:flex-start; margin-top:12px; }
   .meta-box img { width:180px; border-radius:8px; border:1px solid var(--line); }
   audio, video { max-width:100%; border-radius:8px; }
@@ -680,6 +815,13 @@ function fmtDur(s) {
   return Math.floor(m/60) ? `${Math.floor(m/60)}:${String(m%60).padStart(2,'0')}:${String(r).padStart(2,'0')}`
                           : `${m}:${String(r).padStart(2,'0')}`;
 }
+function fmtSize(n) {
+  if (n === null || n === undefined) return "—";
+  const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+  let value = n, i = 0;
+  while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
+  return `${i ? value.toFixed(1) : Math.round(value)} ${units[i]}`;
+}
 async function api(path, opts = {}) {
   const res = await fetch(path, {headers: {"Content-Type": "application/json"}, ...opts});
   let data;
@@ -694,10 +836,12 @@ function refresh() {
 }
 function renderCounts() {
   const c = state.counts || {total: state.jobs.length, published: 0, ready_to_publish: 0};
-  const f = state.files || {inbox_audio: 0, inbox_unregistered: 0, output_videos: 0};
+  const f = state.files || {inbox_audio: 0, inbox_unregistered: 0, inbox_bytes: 0,
+                            output_videos: 0, output_bytes: 0};
   document.getElementById("counts").textContent =
     `${c.total} задач · на YouTube ${c.published} · готових ${c.ready_to_publish} · ` +
-    `inbox ${f.inbox_audio} (поза чергою ${f.inbox_unregistered}) · mp4 ${f.output_videos}`;
+    `inbox ${f.inbox_audio} (поза чергою ${f.inbox_unregistered}) · аудіо ${fmtSize(f.inbox_bytes)} · ` +
+    `mp4 ${f.output_videos} · відео ${fmtSize(f.output_bytes)}`;
 }
 function visibleJobs() {
   const q = (document.getElementById("q").value || "").trim().toLowerCase();
@@ -729,18 +873,34 @@ function render() {
                    j.playlist ? "плейлист" : ""].filter(Boolean).join(" · ");
     const thumb = j.thumbnail ? `<img src="/media/${encodeURI(j.thumbnail)}" alt="">` : "";
     const preview = j.preview ? `<video controls preload="metadata" src="/media/${encodeURI(j.preview)}"></video>` : "";
+    const audioInfo = j.audio_exists
+      ? `аудіо ${fmtSize(j.audio_size)}`
+      : (j.audio_deleted ? `<span class="gone">аудіо видалено (було скачано)</span>`
+                         : `<span class="gone">аудіо відсутнє</span>`);
+    const videoInfo = j.video_exists
+      ? `відео ${fmtSize(j.video_size)}`
+      : (j.url ? `<span class="gone">відео видалено · на YouTube є</span>` : "відео не відрендерено");
+    const files = `<div class="files">
+      <span class="f">${audioInfo}</span>
+      ${j.audio_exists ? `<button class="ghost danger" onclick="deleteAudio(${j.id})">Видалити аудіо</button>` : ""}
+      ${j.audio_deleted ? `<button class="ghost" onclick="restoreAudio(${j.id})">Відновити аудіо</button>` : ""}
+      <span class="f">${videoInfo}</span>
+      ${j.video_exists ? `<button class="ghost danger" onclick="deleteVideo(${j.id})">Видалити відео</button>` : ""}
+    </div>`;
+    const noAudio = j.audio_exists ? "" : `disabled title="немає аудіо — відновіть його"`;
     return `<div class="job">
       <div class="top">${badge}<span class="title">${esc(j.title)}</span>
         <span class="hint">${fmtDur(j.duration)}</span></div>
       <div class="sub">#${j.id} · ${esc(j.audio)} · ${esc(j.status)}${yt}${flags ? " · " + flags : ""}</div>
       ${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}
       <div class="meta-box">${thumb}<div>${preview}</div></div>
+      ${files}
       <div class="actions">
-        <button onclick="act(${j.id},'transcribe')">Транскрипт</button>
+        <button ${noAudio} onclick="act(${j.id},'transcribe')">Транскрипт</button>
         <button onclick="act(${j.id},'describe')">Метадані LLM</button>
         <button class="ghost" onclick="editMeta(${j.id})">Редагувати</button>
-        <button class="ghost" onclick="act(${j.id},'preview')">Прев'ю 20с</button>
-        <button onclick="act(${j.id},'render')">Рендер</button>
+        <button class="ghost" ${noAudio} onclick="act(${j.id},'preview')">Прев'ю 20с</button>
+        <button ${noAudio} onclick="act(${j.id},'render',${j.video_exists ? "false" : "true"})">Рендер</button>
         ${j.url
           ? `<select class="privacy" id="privacy-${j.id}">
                <option value="public">public</option>
@@ -757,7 +917,10 @@ function render() {
 async function act(id, action, force = false) {
   setBusy(true, action === "render" ? "рендер… це може тривати кілька хвилин"
               : action === "describe" ? "LLM генерує метадані…"
-              : action === "upload" ? "завантаження на YouTube…" : "працюю…");
+              : action === "upload" ? "завантаження на YouTube…"
+              : action === "delete_audio" ? "видаляю аудіо…"
+              : action === "delete_video" ? "видаляю відео…"
+              : action === "restore_audio" ? "відновлюю позначку…" : "працюю…");
   try {
     const data = await api(`/api/jobs/${id}/${action}${force ? "?force=1" : ""}`, {method: "POST"});
     setLog(data.log && data.log.length ? data.log : [data.message]);
@@ -768,6 +931,17 @@ async function act(id, action, force = false) {
     await refresh();
   }
 }
+async function deleteAudio(id) {
+  if (!confirm("Видалити аудіофайл? Задача, метадані й відео на YouTube лишаться. " +
+               "Синк не качатиме це аудіо повторно; можна відновити кнопкою «Відновити аудіо».")) return;
+  await act(id, "delete_audio");
+}
+async function deleteVideo(id) {
+  if (!confirm("Видалити локальні mp4 (відео і прев'ю)? Якщо відео вже на YouTube, воно там лишиться; " +
+               "файл можна відрендерити знову.")) return;
+  await act(id, "delete_video");
+}
+async function restoreAudio(id) { await act(id, "restore_audio"); }
 async function publishJob(id) {
   const sel = document.getElementById(`privacy-${id}`);
   const privacy = sel ? sel.value : "public";
@@ -923,6 +1097,7 @@ async function loadList() {
   const rows = data.notebooks.map(n => `<tr>
       <td><a href="/notebooks/${encodeURIComponent(n.id)}">${esc(n.title)}</a></td>
       <td class="n">${n.downloaded}</td>
+      <td class="n ${n.deleted ? "warn" : ""}">${n.deleted}</td>
       <td class="n">${n.queued}</td>
       <td class="n ok">${n.published}</td>
       <td class="n ${n.errors ? "bad" : ""}">${n.errors}</td>
@@ -930,7 +1105,7 @@ async function loadList() {
       <td class="muted">${esc((n.synced_at || "").slice(0, 16).replace("T", " "))}</td>
     </tr>`).join("");
   return `<h2>Ноутбуки NotebookLM</h2><div class="table-wrap"><table>
-    <tr><th>Ноутбук</th><th>Скачано</th><th>У черзі</th><th>Опубліковано</th><th>Помилки</th><th>Зникли</th><th>Синк</th></tr>
+    <tr><th>Ноутбук</th><th>Скачано</th><th>Аудіо видалено</th><th>У черзі</th><th>Опубліковано</th><th>Помилки</th><th>Зникли</th><th>Синк</th></tr>
     ${rows}</table></div>`;
 }
 async function loadOne(id) {
@@ -940,7 +1115,11 @@ async function loadOne(id) {
   if (!data.items.length) return `<h2>${esc(nb.title)}${link}</h2><div class="empty">Переказів ще немає.</div>`;
   const rows = data.items.map(i => {
     const status = i.job_status ? (UA[i.job_status] || i.job_status) : "без задачі";
-    const state = i.state === "missing" ? `<span class="warn">зник з NotebookLM</span>` : "";
+    const audio = i.audio_deleted
+      ? `<span class="warn">аудіо видалено</span>`
+      : (i.audio_exists ? "" : `<span class="warn">аудіо відсутнє</span>`);
+    const state = [i.state === "missing" ? `<span class="warn">зник з NotebookLM</span>` : "", audio]
+      .filter(Boolean).join(" · ");
     const yt = i.url ? `<a href="${esc(i.url)}" target="_blank">${esc(i.url.replace("https://", ""))}</a>` : "—";
     return `<tr>
       <td>${esc(i.title)}<div class="muted" style="font-size:12px">${esc((i.created_at || "").slice(0, 10))} ${state}</div></td>

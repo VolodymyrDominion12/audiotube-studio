@@ -56,7 +56,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
     bytes INTEGER,
     state TEXT NOT NULL DEFAULT 'downloaded',
     job_id INTEGER,
-    downloaded_at TEXT
+    downloaded_at TEXT,
+    -- локальне аудіо свідомо видалено (spec 014); історія завантаження лишається
+    audio_deleted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_notebook ON artifacts(notebook_id);
 -- фактичні публікації: денний бюджет демона і «не частіше ніж раз на N годин»
@@ -81,6 +83,11 @@ _MIGRATIONS = {
     "subtitles": "TEXT",
     "captions_id": "TEXT",
     "attempts": "INTEGER NOT NULL DEFAULT 0",
+}
+
+# колонки artifacts, додані після першої версії (spec 014)
+_ARTIFACT_MIGRATIONS = {
+    "audio_deleted": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -135,11 +142,15 @@ class Database:
 
     def _migrate(self) -> None:
         """Додає колонки, яких немає у базі, створеній попередньою версією."""
-        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(jobs)")}
-        for column, sql_type in _MIGRATIONS.items():
-            if column not in existing:
-                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {sql_type}")
+        self._add_columns("jobs", _MIGRATIONS)
+        self._add_columns("artifacts", _ARTIFACT_MIGRATIONS)
         self.conn.commit()
+
+    def _add_columns(self, table: str, migrations: dict[str, str]) -> None:
+        existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        for column, sql_type in migrations.items():
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
     def __enter__(self) -> "Database":
         return self
@@ -232,13 +243,13 @@ class Database:
         self.conn.execute(
             """INSERT INTO artifacts
                    (id, notebook_id, kind, title, created_at, duration, path, sha256, bytes,
-                    state, downloaded_at)
-               VALUES (?, ?, 'audio', ?, ?, ?, ?, ?, ?, ?, ?)
+                    state, downloaded_at, audio_deleted)
+               VALUES (?, ?, 'audio', ?, ?, ?, ?, ?, ?, ?, ?, 0)
                ON CONFLICT(id) DO UPDATE SET
                    title=excluded.title, created_at=excluded.created_at,
                    duration=excluded.duration, path=excluded.path, sha256=excluded.sha256,
                    bytes=excluded.bytes, state=excluded.state,
-                   downloaded_at=excluded.downloaded_at""",
+                   downloaded_at=excluded.downloaded_at, audio_deleted=0""",
             (artifact_id, notebook_id, title, created_at, duration, str(path), sha256, size,
              state, _now()),
         )
@@ -266,6 +277,33 @@ class Database:
         self.conn.execute("UPDATE artifacts SET job_id=? WHERE id=?", (job_id, artifact_id))
         self.conn.commit()
 
+    # --- локальне аудіо (spec 014) ------------------------------------------
+    def set_audio_deleted(
+        self, job_id: int, audio: Path | None = None, *, deleted: bool = True
+    ) -> int:
+        """Позначає локальне аудіо задачі видаленим/відновленим.
+
+        Шукає артефакти і за `job_id`, і за шляхом: так працює навіть для старих баз,
+        де зв'язок із задачею ще не був записаний. Повертає кількість оновлених рядків.
+        """
+        clause, args = "job_id=?", [job_id]
+        if audio is not None:
+            clause += " OR path=?"
+            args.append(str(audio))
+        cur = self.conn.execute(
+            f"UPDATE artifacts SET audio_deleted=? WHERE {clause}",
+            (1 if deleted else 0, *args),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def audio_deleted_job_ids(self) -> set[int]:
+        """Id задач, чиє аудіо свідомо видалене (spec 014)."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT job_id FROM artifacts WHERE audio_deleted=1 AND job_id IS NOT NULL"
+        )
+        return {int(r["job_id"]) for r in rows}
+
     # --- зведення для веб-UI (spec 008) -------------------------------------
     def notebook_stats(self) -> list[sqlite3.Row]:
         """Ноутбуки з лічильниками переказів; визначення лічильників — spec 008 §5."""
@@ -273,6 +311,7 @@ class Database:
             """SELECT n.id, n.title, n.slug, n.url, n.sources, n.synced_at,
                       COUNT(a.id) AS downloaded,
                       COALESCE(SUM(a.state = 'missing'), 0) AS missing,
+                      COALESCE(SUM(a.audio_deleted), 0) AS deleted,
                       COALESCE(SUM(j.video_id IS NOT NULL), 0) AS published,
                       COALESCE(SUM(j.video_id IS NULL AND j.error IS NOT NULL), 0) AS errors,
                       COALESCE(SUM(a.id IS NOT NULL AND j.video_id IS NULL AND j.error IS NULL), 0)
@@ -288,7 +327,7 @@ class Database:
         """Перекази ноутбука разом зі станом прив'язаної задачі (якщо є)."""
         return self.conn.execute(
             """SELECT a.id, a.title, a.created_at, a.duration, a.state, a.path, a.job_id,
-                      j.status AS job_status, j.video_id, j.error, j.attempts
+                      a.audio_deleted, j.status AS job_status, j.video_id, j.error, j.attempts
                FROM artifacts a
                LEFT JOIN jobs j ON j.id = a.job_id
                WHERE a.notebook_id = ?

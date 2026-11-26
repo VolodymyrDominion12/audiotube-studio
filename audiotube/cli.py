@@ -103,11 +103,15 @@ def cmd_sync(args) -> int:
     finally:
         db.close()
 
-    marks = {"plan": "~", "download": "+", "repair": "+", "missing": "-", "restored": "↺", "changed": "?"}
+    marks = {
+        "plan": "~", "download": "+", "repair": "+", "missing": "-", "restored": "↺",
+        "changed": "?", "deleted": "×",
+    }
     notes = {
         "missing": "  (зник із NotebookLM; локальний файл лишається)",
         "restored": "  (знову є в NotebookLM)",
         "changed": "  (вміст змінився в NotebookLM; локальний файл не змінено)",
+        "deleted": "  (аудіо видалено локально — не качаємо повторно; spec 014)",
     }
     for item in report.items:
         if item.action in marks:
@@ -127,6 +131,7 @@ def cmd_sync(args) -> int:
             ("зникло з NotebookLM", report.missing),
             ("повернулося", report.restored),
             ("змінилося", report.changed),
+            ("видалено локально", report.deleted),
         )
         if n
     ]
@@ -371,6 +376,9 @@ def _process(
         jobs = [job for job in pipe.db.list() if not _has_video(job)]
     else:
         jobs = pipe.db.list(("new", "transcribed", "described"))
+    # spec 014: без аудіо транскрипція/рендер неможливі — не витрачаємо спроби задачі
+    deleted = pipe.db.audio_deleted_job_ids()
+    jobs = [job for job in jobs if job.id not in deleted]
     if limit is not None:
         jobs = jobs[:limit]
     for job in jobs:
