@@ -22,6 +22,8 @@
 - `ytcp-thumbnail-uploader input[type=file]` (`#file-loader`) має `hidden`/`display: none` (`0×0`),
   тому очікувати `state="visible"` не можна — чекаємо `visible` для `ytcp-thumbnail-uploader`
   і `attached` для `input[type=file]`; ставимо обкладинку одразу на кроці «Деталі» при створенні відео.
+- У таблиці «Контент каналу» за діалогом незавершені старі чернетки мають свій `.progress-label`
+  (напр. `Завантаження: 44%`), тому прогрес завантаження шукаємо лише всередині `ytcp-uploads-dialog`.
 - Playwright через CDP відмовляється передавати файли >50 МБ («not co-located»), тому шлях
   ставимо через `DOM.setFileInputFiles` (Chrome локальний і сам читає файл).
 - Посилання в діалозі до натискання «Опублікувати» — це ще чернетка; `video_id` беремо

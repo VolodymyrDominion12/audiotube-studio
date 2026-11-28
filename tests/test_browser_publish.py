@@ -687,6 +687,40 @@ class BrowserPlanTests(BrowserTestBase):
         with self.assertRaises(BrowserError):
             studio._click_done()
 
+    def test_wait_upload_complete_ignores_background_table_progress(self):
+        """BROW-AC16: прогрес береться лише з діалогу завантаження, не зі старої чернетки в таблиці."""
+        root = self.make_root()
+        cfg = load_config(root=root)
+
+        class ProgressLocator:
+            def __init__(self, text):
+                self._text = text
+                self.first = self
+
+            def count(self):
+                return 1 if self._text is not None else 0
+
+            def inner_text(self, timeout=None):
+                return self._text or ""
+
+        class StudioPageWithStaleDraft:
+            def is_closed(self):
+                return False
+
+            def locator(self, selector):
+                if "ytcp-uploads-dialog" in selector:
+                    return ProgressLocator("Перевірки виконано. Проблем не виявлено.")
+                return ProgressLocator("Завантаження: 44%")
+
+        session = FakeSession(logged_in=True)
+        session.page = StudioPageWithStaleDraft()
+        studio = PlaywrightStudio(session, cfg, log=lambda *_: None)
+
+        with mock.patch("audiotube.browser_publish.time.sleep"):
+            done = studio._wait_upload_complete(timeout=0.05)
+
+        self.assertTrue(done)
+
 
 if __name__ == "__main__":
     unittest.main()

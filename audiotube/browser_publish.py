@@ -963,15 +963,19 @@ class PlaywrightStudio:
             self._ensure_open("очікування завершення завантаження")
             text = ""
             for selector in (
-                ".progress-label",
-                "span.progress-label",
-                "ytcp-video-upload-progress",
                 "ytcp-uploads-dialog .progress-label",
+                "ytcp-uploads-dialog span.progress-label",
+                "ytcp-uploads-dialog ytcp-video-upload-progress",
+                "ytcp-upload-dialog .progress-label",
+                "ytcp-upload-dialog ytcp-video-upload-progress",
             ):
                 locator = self.page.locator(selector).first
                 try:
                     if locator.count():
-                        text = (locator.inner_text() or "").strip()
+                        try:
+                            text = (locator.inner_text(timeout=2_000) or "").strip()
+                        except TypeError:
+                            text = (locator.inner_text() or "").strip()
                         if text:
                             break
                 except Exception:  # noqa: BLE001
@@ -985,7 +989,8 @@ class PlaywrightStudio:
                         "processing", "checks", "checks complete", "complete",
                         "finished", "uploaded", "no issues found",
                         "оброб", "перевір", "заверш", "готово",
-                        "порушень не виявлено", "上传完成", "处理",
+                        "порушень не виявлено", "проблем не виявлено",
+                        "上传完成", "处理",
                     )
                 ):
                     self.log(f"завантаження завершено: {text[:60]}")
