@@ -1540,6 +1540,9 @@ function renderGroups() {
       loadGroupJobs(openKey);
     }
   }
+  if (activeRun && activeRun.status === "running") {
+    setSyncButtonsDisabled(true, activeRun.notebook_id);
+  }
 }
 async function loadGroups({force = false} = {}) {
   try {
