@@ -28,6 +28,8 @@ audiotube doctor                 # перевірка середовища, ко
 | `auth` | одноразова авторизація YouTube (браузер) |
 | `upload` | завантаження на YouTube + обкладинка + субтитри + плейлист |
 | `publish` | зміна приватності вже завантаженого відео (spec 010) |
+| `browser-auth` | ручний вхід у Google у справжньому Chrome (spec 016) |
+| `browser-upload` | завантаження через UI YouTube Studio, без Data API і квоти |
 | `captions` | додає субтитри до вже завантаженого відео |
 | `run` | усі кроки для всієї черги |
 | `watch` | стежить за `inbox/` і обробляє нове |
@@ -100,6 +102,22 @@ audiotube subtitles --dry-run       # що зміниться в SRT, нічог
 
 Статуси: `new → transcribed → described → rendered → uploaded → done`. Повторний запуск кроку
 нічого не дублює і не знижує статус.
+
+### Публікація через браузер (spec 016)
+
+```bash
+audiotube browser-auth                    # один раз: звичайне вікно Chrome, вхід і закрити вікно
+audiotube browser-upload                  # усі rendered/uploaded; типово private
+audiotube browser-upload 185 --review     # заповнити все, фінальний клік — людина
+audiotube browser-upload 185 --dry-run    # заповнити форму, не публікувати, БД не змінювати
+audiotube browser-upload 185 --keep-open  # лишити вікно відкритим
+```
+
+Профіль — `data/browser/youtube/` (окремий від вашого Chrome), скриншоти помилок —
+`data/browser/screenshots/`. Data API не викликається, квота не списується, але запис у
+`uploads` і статуси `uploaded`/`done` ті самі. Режим інтерактивний: демон і systemd його не
+використовують. `publish_at` не підтримується; плейлисти не змінюються. Обкладинка й
+субтитри — best-effort (попередження в журналі, публікація не падає).
 
 ## 4. Пакетно
 
@@ -202,23 +220,34 @@ audiotube web                       # http://127.0.0.1:8765
 audiotube web --port 9000 --open    # інший порт і одразу відкрити браузер
 ```
 
-Локальна сторінка без збірки й залежностей: лічильники (задачі, на YouTube, готові до публікації,
-аудіо в `inbox/` поза чергою, `.mp4` у `output/`, сумарні розміри аудіо й відео), фільтр за
-статусом і пошук, картки задач із прев'ю, кнопки кроків, редагування YAML і зміна приватності
-вже завантажених відео. Кнопки «Видалити аудіо» / «Видалити відео» звільняють місце, зберігаючи
-історію: аудіо позначається в БД (`artifacts.audio_deleted`) і `sync` не качає його повторно,
-а `video_id` та посилання на YouTube лишаються; «Відновити аудіо» знімає позначку. Сторінка
-`/notebooks` — синк і статистика по ноутбуках. Той самий сервер віддає API:
+Локальна сторінка без збірки й залежностей: акордеон ноутбуків із лічильниками й лінивим
+підвантаженням карток, пошук по всій черзі (задача/файл/ноутбук) і фільтр статусу, картки з
+прев'ю, кнопки кроків, редагування YAML, зміна приватності й кнопка «Синк + відео» для
+ноутбука (фоново: нові аудіо + рендер, без публікації). Кнопки «Видалити аудіо» /
+«Видалити відео» звільняють місце, зберігаючи історію: аудіо позначається в БД
+(`artifacts.audio_deleted`) і `sync` не качає його повторно, а `video_id` та посилання на
+YouTube лишаються; «Відновити аудіо» знімає позначку. Сторінка `/notebooks` — акордеон
+ноутбуків: лічильники в згорнутому рядку, ліниве підвантаження переказів при розгортанні,
+пошук за назвою і фільтр за станом; відкритий ноутбук має адресу `/notebooks/<id>`. Той самий
+сервер віддає API:
 
 ```
-GET  /api/state                                   # задачі, квота, counts, files
+GET  /api/state                                   # повний стан (сумісність): jobs, квота, counts, files
+GET  /api/overview                                # легкий стан: counts, files, quota, config, sync
+GET  /api/groups                                  # ноутбуки + «Без ноутбука» з лічильниками
+GET  /api/groups/<key>/jobs                       # картки однієї групи (ліниве завантаження)
+GET  /api/jobs?q=&status=                         # пошук по всій черзі
+POST /api/groups/<key>/sync                       # фоновий синк+рендер ноутбука → 202
+GET  /api/groups/<key>/sync                       # стан і журнал прогону
 POST /api/scan
 POST /api/sync?dry_run=1
 POST /api/jobs/<id>/{transcribe,describe,render,preview,upload,reset}
 POST /api/jobs/<id>/{delete_audio,delete_video,restore_audio}
 POST /api/jobs/<id>/publish?privacy=public
+POST /api/jobs/<id>/browser-upload?review=1       # фонова публікація через Chrome
+GET  /api/browser                                 # стан і журнал браузерного прогону
 GET/PUT /api/jobs/<id>/meta
-GET  /api/notebooks, /api/daemon
+GET  /api/notebooks, /api/notebooks/<id>, /api/daemon
 ```
 
 ### Квота YouTube

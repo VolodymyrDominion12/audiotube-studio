@@ -16,6 +16,7 @@ import json
 import mimetypes
 import threading
 import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -173,15 +174,101 @@ class WebApp:
         self.port = port
         self.adapter = adapter  # None → справжній NotebookLM (build_adapter у SyncService)
         self.lock = threading.Lock()
+        self._sync_state_lock = threading.Lock()
+        self.sync_run: dict | None = None
+        # spec 016: браузерна публікація виконується у фоні, по одній за раз
+        self._browser_lock = threading.Lock()
+        self.browser_thread: threading.Thread | None = None
+        self.browser_state: dict = {
+            "status": "idle",
+            "job": None,
+            "review": False,
+            "message": "",
+            "log": [],
+            "video_id": None,
+        }
+
+    # --- браузерна публікація (spec 016) ------------------------------------
+    def start_browser_upload(self, job_id: int, review: bool = False) -> dict:
+        """Запускає фонову публікацію через Chrome; повторний запуск — Busy."""
+        with self._browser_lock:
+            if self.browser_thread is not None and self.browser_thread.is_alive():
+                raise Busy("браузер уже працює — дочекайтеся завершення")
+            pipe = Pipeline(self.cfg, log=lambda *_: None)
+            try:
+                job = pipe.db.get(job_id)
+            finally:
+                pipe.db.close()
+            if job is None:
+                raise NotFound(f"задачу {job_id} не знайдено")
+            if job.status == "done":
+                raise WebError("задача вже опублікована")
+            if job.status not in ("rendered", "uploaded"):
+                raise WebError("спершу відрендеріть відео")
+            if not job.video_id and not (job.video and job.video.exists()):
+                raise WebError("файл відео не знайдено")
+            self.browser_state = {
+                "status": "running",
+                "job": job_id,
+                "review": review,
+                "message": "відкриваю браузер…",
+                "log": ["відкриваю Chrome…"],
+                "video_id": None,
+            }
+            self.browser_thread = threading.Thread(
+                target=self._browser_upload, args=(job_id, review), daemon=True
+            )
+            self.browser_thread.start()
+        return {"ok": True, "started": True, "job": job_id, "review": review}
+
+    def _browser_upload(self, job_id: int, review: bool) -> None:
+        from audiotube.browser_publish import BrowserPublisher
+
+        logs: list[str] = []
+
+        def log(message) -> None:
+            logs.append(str(message))
+            self.browser_state["log"] = logs[-200:]
+            self.browser_state["message"] = str(message)
+
+        pipe = Pipeline(self.cfg, log=log, interactive=True)
+        try:
+            job = pipe.db.get(job_id)
+            if job is None:
+                raise WebError(f"задачу {job_id} не знайдено")
+            publisher = BrowserPublisher(pipe, log=log)
+            try:
+                job = publisher.publish(job, review=review)
+            finally:
+                publisher.close()
+            self.browser_state["video_id"] = job.video_id
+            self.browser_state["status"] = "done" if job.status == "done" else "error"
+            self.browser_state["message"] = job.error or (
+                f"готово: {job.url}" if job.video_id else "готово"
+            )
+            self.browser_state["log"] = logs[-200:]
+        except Exception as exc:  # noqa: BLE001 — веб-сервер не має падати
+            self.browser_state["status"] = "error"
+            self.browser_state["message"] = str(exc)
+            self.browser_state["log"] = (logs + [f"помилка: {exc}"])[-200:]
+        finally:
+            pipe.db.close()
+
+    def browser_snapshot(self) -> dict:
+        with self._browser_lock:
+            return {"ok": True, **self.browser_state}
 
     # --- серіалізація стану --------------------------------------------------
-    def state(self) -> dict:
+    def _snapshot(self, *, with_jobs: bool) -> dict:
         with self.lock:
             pipe = Pipeline(self.cfg, log=lambda *_: None)
             try:
                 rows = pipe.db.list()
                 deleted = pipe.db.audio_deleted_job_ids()
-                jobs = [job_json(self.cfg, j, audio_deleted=j.id in deleted) for j in rows]
+                jobs = (
+                    [job_json(self.cfg, j, audio_deleted=j.id in deleted) for j in rows]
+                    if with_jobs else []
+                )
                 used = pipe.quota.used()
                 limit = pipe.quota.daily_limit
                 files = disk_stats(self.cfg, rows)
@@ -190,8 +277,7 @@ class WebApp:
         by_status = {status: 0 for status in STATUS_ORDER}
         for row in rows:
             by_status[row.status] = by_status.get(row.status, 0) + 1
-        return {
-            "jobs": jobs,
+        data: dict = {
             "counts": {
                 "total": len(rows),
                 "by_status": by_status,
@@ -209,6 +295,124 @@ class WebApp:
                 "ffmpeg": has_ffmpeg(),
             },
         }
+        if with_jobs:
+            data["jobs"] = jobs
+        return data
+
+    def state(self) -> dict:
+        return self._snapshot(with_jobs=True)
+
+    def overview(self) -> dict:
+        """WEB3-R1: легкий знімок для головної сторінки — без важких карток задач."""
+        data = self._snapshot(with_jobs=False)
+        data["sync"] = self.sync_state()
+        return data
+
+    # --- групи черги (spec 017) ----------------------------------------------
+    @staticmethod
+    def _blank_group(nb) -> dict:
+        return {
+            "key": nb["id"] if nb else "__none__",
+            "id": nb["id"] if nb else None,
+            "title": nb["title"] if nb else "Без ноутбука",
+            "slug": nb["slug"] if nb else None,
+            "url": nb["url"] if nb else None,
+            "synced_at": nb["synced_at"] if nb else None,
+            "jobs": 0,
+            "by_status": {status: 0 for status in STATUS_ORDER},
+            "published": 0,
+            "errors": 0,
+            "ready": 0,
+            "audio_deleted": 0,
+            "can_sync": nb is not None,
+        }
+
+    @staticmethod
+    def _add_job_to_group(group: dict, job: Job, deleted: set[int]) -> None:
+        group["jobs"] += 1
+        group["by_status"][job.status] = group["by_status"].get(job.status, 0) + 1
+        if job.video_id:
+            group["published"] += 1
+        elif job.error:
+            group["errors"] += 1
+        if job.status == "rendered":
+            group["ready"] += 1
+        if job.id in deleted:
+            group["audio_deleted"] += 1
+
+    def _job_json_with_group(self, job: Job, mapping: dict, deleted: set[int]) -> dict:
+        data = job_json(self.cfg, job, audio_deleted=job.id in deleted)
+        nb_id, nb_title = mapping.get(job.id, (None, None))
+        data["notebook_id"] = nb_id
+        data["notebook_title"] = nb_title
+        return data
+
+    def groups(self) -> dict:
+        """WEB3-R2: ноутбуки й «Без ноутбука» з лічильниками задач."""
+        with Database(self.cfg.db_path) as db:
+            notebooks = [dict(nb) for nb in db.notebooks()]
+            jobs = db.list()
+            mapping = db.job_notebooks()
+            deleted = db.audio_deleted_job_ids()
+
+        by_id = {nb["id"]: self._blank_group(nb) for nb in notebooks}
+        unassigned = self._blank_group(None)
+        for job in jobs:
+            nb_id, _ = mapping.get(job.id, (None, None))
+            group = by_id.get(nb_id) or unassigned
+            self._add_job_to_group(group, job, deleted)
+
+        # спершу ноутбуки з більшою чергою, далі порожні; «Без ноутбука» — у кінці
+        result = sorted(
+            by_id.values(),
+            key=lambda g: (g["jobs"] == 0, -g["jobs"], (g["title"] or "").lower()),
+        )
+        if unassigned["jobs"]:
+            result.append(unassigned)
+        return {"ok": True, "groups": result}
+
+    def group_jobs(self, key: str) -> dict:
+        """WEB3-R3: задачі однієї групи; key = id ноутбука або __none__."""
+        nb = None
+        if key != "__none__":
+            with Database(self.cfg.db_path) as db:
+                row = db.notebook(key)
+            if row is None:
+                raise NotFound(f"ноутбук {key} не знайдено")
+            nb = dict(row)
+
+        with Database(self.cfg.db_path) as db:
+            jobs = db.jobs_for_notebook(nb["id"] if nb else None)
+            mapping = db.job_notebooks()
+            deleted = db.audio_deleted_job_ids()
+
+        group = self._blank_group(nb)
+        for job in jobs:
+            self._add_job_to_group(group, job, deleted)
+        return {
+            "ok": True,
+            "group": group,
+            "jobs": [self._job_json_with_group(job, mapping, deleted) for job in jobs],
+        }
+
+    def search_jobs(self, q: str, status: str) -> dict:
+        """WEB3-R4: пошук по всій черзі без завантаження всіх груп."""
+        if status and status not in STATUS_ORDER:
+            raise WebError(f"невідомий статус: {status}")
+        with Database(self.cfg.db_path) as db:
+            jobs = db.list((status,) if status else None)
+            mapping = db.job_notebooks()
+            deleted = db.audio_deleted_job_ids()
+
+        needle = (q or "").strip().lower()
+        result = []
+        for job in jobs:
+            _, nb_title = mapping.get(job.id, (None, None))
+            haystack = f"{job.title or ''} {job.audio.name} {job.slug} {nb_title or ''}".lower()
+            if needle and needle not in haystack:
+                continue
+            result.append(self._job_json_with_group(job, mapping, deleted))
+        return {"ok": True, "jobs": result, "total": len(result)}
 
     # --- дії -----------------------------------------------------------------
     def action(self, job_id: int, action: str, force: bool = False, privacy: str = "public") -> dict:
@@ -436,6 +640,212 @@ class WebApp:
             "message": _sync_summary(report, dry_run),
         }
 
+    # --- синк одного ноутбука (spec 017) ------------------------------------
+    @staticmethod
+    def _run_json(run: dict) -> dict:
+        return {
+            "notebook_id": run["notebook_id"],
+            "title": run["title"],
+            "status": run["status"],
+            "started_at": run["started_at"],
+            "finished_at": run["finished_at"],
+            "processed": run["processed"],
+            "total": run["total"],
+            "remaining": run["remaining"],
+            "error": run["error"],
+            "message": run["message"],
+            "report": run["report"],
+            "jobs": list(run["jobs"]),
+            "log": list(run["log"][-40:]),
+        }
+
+    def sync_state(self) -> dict | None:
+        with self._sync_state_lock:
+            return self._run_json(self.sync_run) if self.sync_run else None
+
+    def _run_set(self, run: dict, **fields) -> None:
+        with self._sync_state_lock:
+            run.update(fields)
+
+    def _run_log(self, run: dict, line: str) -> None:
+        with self._sync_state_lock:
+            run["log"].append(str(line))
+            run["message"] = str(line)
+
+    def start_notebook_sync(self, notebook_id: str) -> dict:
+        """WEB3-R5: синк + рендер одного ноутбука у фоні (без публікації)."""
+        with Database(self.cfg.db_path) as db:
+            row = db.notebook(notebook_id)
+        if row is None:
+            raise NotFound(f"ноутбук {notebook_id} не знайдено")
+        nb = dict(row)
+
+        with self._sync_state_lock:
+            active = self.sync_run
+            if active and active["status"] == "running":
+                raise Busy(f"уже виконується синк ноутбука «{active['title']}»")
+
+        lock = daemon_lock(self.cfg)
+        if not lock.acquire():
+            raise Busy(
+                "демон уже працює (замок зайнятий) — синк ноутбука не запущено, спробуйте пізніше"
+            )
+        run = {
+            "notebook_id": notebook_id,
+            "title": nb["title"],
+            "status": "running",
+            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "finished_at": None,
+            "processed": 0,
+            "total": 0,
+            "remaining": 0,
+            "error": None,
+            "message": "синхронізую…",
+            "report": None,
+            "jobs": [],
+            "log": [],
+        }
+        with self._sync_state_lock:
+            self.sync_run = run
+        try:
+            threading.Thread(
+                target=self._notebook_sync_worker, args=(run, lock), daemon=True
+            ).start()
+        except Exception:
+            lock.release()
+            with self._sync_state_lock:
+                self.sync_run = None
+            raise
+        with self._sync_state_lock:
+            snapshot = self._run_json(run)
+        return {"ok": True, "run": snapshot}
+
+    def notebook_sync(self, notebook_id: str) -> dict:
+        """WEB3-R9: стан фонового прогону для конкретного ноутбука."""
+        with Database(self.cfg.db_path) as db:
+            if db.notebook(notebook_id) is None:
+                raise NotFound(f"ноутбук {notebook_id} не знайдено")
+        with self._sync_state_lock:
+            run = (
+                self._run_json(self.sync_run)
+                if self.sync_run and self.sync_run["notebook_id"] == notebook_id
+                else None
+            )
+        return {"ok": True, "run": run}
+
+    def _notebook_sync_worker(self, run: dict, lock) -> None:
+        db = None
+        try:
+            db = Database(self.cfg.db_path)
+            log = lambda line: self._run_log(run, line)  # noqa: E731 — короткий колбек
+            pipe = Pipeline(self.cfg, db=db, log=log, interactive=False)
+            service = SyncService(self.cfg, db=db, adapter=self.adapter, log=log)
+            report = service.run(notebook=run["notebook_id"])
+            self._run_set(run, report=report_json(report))
+            self._run_log(run, _sync_summary(report, False))
+
+            deleted = db.audio_deleted_job_ids()
+            all_jobs = db.jobs_for_notebook(run["notebook_id"])
+            pending = [
+                job
+                for job in all_jobs
+                if job.video_id is None
+                and STATUS_ORDER.get(job.status, 0) < STATUS_ORDER["rendered"]
+            ]
+            no_audio = [job for job in pending if job.id in deleted]
+            missing = [job for job in pending if job.id not in deleted and not job.audio.exists()]
+            exhausted = [
+                job for job in pending if job.attempts >= self.cfg.daemon.max_attempts
+            ]
+            if no_audio:
+                self._run_log(run, f"пропущено задач з видаленим аудіо: {len(no_audio)}")
+            if missing:
+                self._run_log(run, f"пропущено задач без аудіофайлу: {len(missing)}")
+            if exhausted:
+                self._run_log(
+                    run,
+                    f"пропущено задач після {self.cfg.daemon.max_attempts} спроб: {len(exhausted)}",
+                )
+            candidates = [
+                job
+                for job in pending
+                if job.id not in deleted
+                and job.audio.exists()
+                and job.attempts < self.cfg.daemon.max_attempts
+            ]
+            limit = self.cfg.notebooklm.max_per_run
+            selected = candidates[:limit]
+            self._run_set(
+                run, total=len(selected), remaining=max(0, len(candidates) - len(selected))
+            )
+
+            for job in selected:
+                self._run_log(run, f"[{job.id}] {job.title or job.audio.name}: обробка…")
+                job = db.update(job.id, error=None)
+                job = self._advance_job(pipe, job)
+                if job.error:
+                    attempts = db.bump_attempt(job.id)
+                    first = job.error.splitlines()[0]
+                    self._run_log(run, f"[{job.id}] помилка (спроба {attempts}): {first}")
+                else:
+                    with self._sync_state_lock:
+                        run["processed"] += 1
+                        run["jobs"].append(
+                            {
+                                "id": job.id,
+                                "title": job.title or job.audio.name,
+                                "status": job.status,
+                                "url": job.url,
+                            }
+                        )
+                    self._run_log(run, f"[{job.id}] готово: {job.status}")
+
+            with self._sync_state_lock:
+                processed = run["processed"]
+                remaining = run["remaining"]
+            if not candidates:
+                if pending:
+                    message = f"синк готово; задач для рендеру немає (пропущено {len(pending)})"
+                else:
+                    message = "синк готово; незавершених задач немає"
+            else:
+                message = f"готово: відео {processed}"
+                if remaining:
+                    message += f"; ще {remaining} у черзі — натисніть «Синк + відео» ще раз"
+            self._run_set(
+                run,
+                status="done",
+                finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                message=message,
+            )
+        except Exception as e:  # noqa: BLE001 — фоновий прогін не має валити сервер
+            self._run_set(
+                run,
+                status="error",
+                error=f"{type(e).__name__}: {e}",
+                finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                message=f"помилка: {e}",
+            )
+            self._run_log(run, f"ПОМИЛКА: {e}")
+        finally:
+            if db is not None:
+                db.close()
+            lock.release()
+
+    def _advance_job(self, pipe: Pipeline, job: Job) -> Job:
+        """Транскрипт → метадані → рендер для однієї задачі (без публікації)."""
+        if STATUS_ORDER.get(job.status, 0) < STATUS_ORDER["transcribed"]:
+            job = pipe.transcribe(job)
+        if job.error:
+            return job
+        if STATUS_ORDER.get(job.status, 0) < STATUS_ORDER["described"]:
+            job = pipe.describe(job)
+        if job.error:
+            return job
+        if STATUS_ORDER.get(job.status, 0) < STATUS_ORDER["rendered"]:
+            job = pipe.render(job)
+        return job
+
     # --- медіа ---------------------------------------------------------------
     def media_path(self, rel: str) -> Path | None:
         rel = unquote(rel).lstrip("/")
@@ -578,12 +988,30 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, NOTEBOOKS_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif parts == ["api", "state"]:
                 self._json(200, self.app.state())
+            elif parts == ["api", "overview"]:
+                self._json(200, self.app.overview())
+            elif parts == ["api", "groups"]:
+                self._json(200, self.app.groups())
+            elif parts == ["api", "jobs"]:
+                query = parse_qs(urlparse(self.path).query)
+                self._json(
+                    200,
+                    self.app.search_jobs(
+                        query.get("q", [""])[0], query.get("status", [""])[0]
+                    ),
+                )
+            elif len(parts) == 4 and parts[:2] == ["api", "groups"] and parts[3] == "jobs":
+                self._json(200, self.app.group_jobs(unquote(parts[2])))
+            elif len(parts) == 4 and parts[:2] == ["api", "groups"] and parts[3] == "sync":
+                self._json(200, self.app.notebook_sync(unquote(parts[2])))
             elif parts == ["api", "notebooks"]:
                 self._json(200, self.app.notebooks())
             elif len(parts) == 3 and parts[:2] == ["api", "notebooks"]:
                 self._json(200, self.app.notebook(unquote(parts[2])))
             elif parts == ["api", "daemon"]:
                 self._json(200, self.app.daemon_state())
+            elif parts == ["api", "browser"]:
+                self._json(200, self.app.browser_snapshot())
             elif len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "meta":
                 self._json(200, self.app.meta(int(parts[2])))
             elif len(parts) >= 2 and parts[0] == "media":
@@ -610,6 +1038,12 @@ class _Handler(BaseHTTPRequestHandler):
             elif parts == ["api", "sync"]:
                 dry_run = "dry_run=1" in (urlparse(self.path).query or "")
                 self._json(200, self.app.sync(dry_run=dry_run))
+            elif len(parts) == 4 and parts[:2] == ["api", "groups"] and parts[3] == "sync":
+                self._json(202, self.app.start_notebook_sync(unquote(parts[2])))
+            elif len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "browser-upload":
+                query = parse_qs(urlparse(self.path).query)
+                review = query.get("review", ["0"])[0] in ("1", "true")
+                self._json(202, self.app.start_browser_upload(int(parts[2]), review=review))
             elif len(parts) == 4 and parts[:2] == ["api", "jobs"]:
                 query = parse_qs(urlparse(self.path).query)
                 force = query.get("force", ["0"])[0] in ("1", "true")
@@ -740,10 +1174,51 @@ HTML = r"""<!doctype html>
           border-radius:50%; animation:sp 0.8s linear infinite; margin-right:12px; }
   @keyframes sp { to { transform:rotate(360deg); } }
   .hint { color:var(--muted); font-size:12px; }
+  .muted { color:var(--muted); }
   .filters { display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap; }
-  .filters input, .filters select { background:var(--panel2); color:var(--text); border:1px solid var(--line);
+  .filters input[type="search"], .filters select { background:var(--panel2); color:var(--text); border:1px solid var(--line);
            border-radius:8px; padding:8px 11px; font:inherit; font-size:14px; }
-  .filters input { flex:1; min-width:220px; }
+  .filters input[type="search"] { flex:1; min-width:220px; }
+  .filters input[type="checkbox"] { width:15px; height:15px; margin:0; padding:0; flex:none; accent-color:var(--accent); }
+  .filters .hint { align-self:center; }
+  .grp { background:var(--panel); border:1px solid var(--line); border-radius:12px; margin-bottom:8px; overflow:hidden; }
+  .grp-row { display:flex; align-items:stretch; }
+  .grp-head { flex:1; min-width:0; display:flex; gap:10px; align-items:flex-start; background:none; border:0;
+              border-radius:0; padding:11px 14px; color:inherit; text-align:left; font:inherit; cursor:pointer; }
+  .grp-head:hover { background:var(--panel2); }
+  .grp-head:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+  .chev { color:var(--muted); font-size:11px; line-height:20px; transition:transform .15s ease; }
+  .grp.open .chev { transform:rotate(90deg); }
+  .grp-main { flex:1; min-width:0; }
+  .grp-title { display:block; font-weight:600; font-size:14.5px; line-height:1.3;
+               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .grp-meta { display:block; margin-top:3px; color:var(--muted); font-size:12px; line-height:1.5; }
+  .grp-meta b { color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; }
+  .grp-meta .warn b { color:var(--warn); }
+  .grp-meta .bad b { color:var(--err); }
+  .grp-meta .ok b { color:var(--ok); }
+  .grp-syncdate { color:var(--muted); font-size:11.5px; white-space:nowrap; margin-top:3px; }
+  .grp-sync { flex:none; align-self:center; margin:0 12px; font-size:12px; padding:6px 10px; }
+  .grp-body { border-top:1px solid var(--line); padding:0 14px 4px; background:rgba(0,0,0,.08); }
+  .grp-jobs { padding-top:12px; }
+  .grp-jobs .job { margin-bottom:12px; }
+  .grp-status { margin-top:12px; padding:8px 10px; border:1px solid var(--line); border-radius:8px;
+                font-size:12.5px; color:var(--muted); display:none; }
+  .grp-status.on { display:block; }
+  .grp-status.running { border-color:var(--accent); color:var(--text); }
+  .grp-status.done { border-color:var(--ok); color:var(--ok); }
+  .grp-status.error { border-color:var(--err); color:var(--err); }
+  .grp-status .bar { height:4px; background:var(--line); border-radius:99px; margin-top:6px; overflow:hidden; }
+  .grp-status .bar i { display:block; height:100%; background:var(--accent); width:0; transition:width .3s; }
+  .search-head { color:var(--muted); font-size:13px; margin:0 0 10px; }
+  .job .nb-tag { color:var(--accent); }
+  .job .nb-tag::before { content:" · "; color:var(--muted); }
+  @media (max-width:640px) {
+    .grp-row { flex-wrap:wrap; }
+    .grp-sync { margin:0 14px 12px 34px; }
+    .grp-title { white-space:normal; }
+    .grp-syncdate { margin-left:20px; }
+  }
   select.privacy { background:var(--panel2); color:var(--text); border:1px solid var(--line);
            border-radius:8px; padding:7px 10px; font:inherit; font-size:13px; }
 </style>
@@ -761,8 +1236,8 @@ HTML = r"""<!doctype html>
 </header>
 <main>
   <div class="filters">
-    <input id="q" type="search" placeholder="пошук за назвою, файлом або slug" oninput="render()">
-    <select id="st" onchange="render()">
+    <input id="q" type="search" placeholder="пошук за задачею, файлом або ноутбуком">
+    <select id="st">
       <option value="">усі статуси</option>
       <option value="new">нове</option>
       <option value="transcribed">транскрипт</option>
@@ -771,6 +1246,10 @@ HTML = r"""<!doctype html>
       <option value="uploaded">на YouTube</option>
       <option value="done">готово</option>
     </select>
+    <label class="hint" style="display:flex;align-items:center;gap:6px">
+      <input type="checkbox" id="browser-review"> перегляд перед публікацією
+    </label>
+    <span class="hint" id="result-info"></span>
   </div>
   <div id="jobs"><div class="empty">Завантаження…</div></div>
 </main>
@@ -792,10 +1271,21 @@ HTML = r"""<!doctype html>
 </dialog>
 
 <script>
+
 const UA = {new:"нове", transcribed:"транскрипт", described:"метадані", rendered:"відрендерено",
             uploaded:"на YouTube", done:"готово"};
-let state = {jobs: [], quota: {used: 0, limit: 0}, config: {}, counts: {}, files: {}};
+let overview = {counts:{}, files:{}, quota:{used:0, limit:0}, config:{}, sync:null};
+let groups = [];
+let groupsByKey = new Map();
+let openKey = null;
+let jobsCache = new Map();
+let jobsLoading = new Set();
 let busyCount = 0;
+let searchTimer = null;
+let searchSeq = 0;
+let activeRun = null;
+let syncPoll = null;
+let browserPoll = null;
 
 function setBusy(on, text) {
   busyCount = Math.max(0, busyCount + (on ? 1 : -1));
@@ -805,10 +1295,10 @@ function setBusy(on, text) {
 function setLog(lines) {
   const el = document.getElementById("log");
   el.classList.add("on");
-  el.innerHTML = lines.map(l => esc(l)).join("\n");
+  el.innerHTML = (lines || []).filter(Boolean).map(l => esc(l)).join("\n");
   el.scrollTop = el.scrollHeight;
 }
-function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function fmtDur(s) {
   if (!s) return "—";
   s = Math.round(s); const m = Math.floor(s/60), r = s%60;
@@ -822,6 +1312,18 @@ function fmtSize(n) {
   while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
   return `${i ? value.toFixed(1) : Math.round(value)} ${units[i]}`;
 }
+function fmtDate(iso) {
+  if (!iso) return "не синкався";
+  const d = String(iso).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(d) ? `синк ${d.split("-").reverse().join(".")}` : esc(iso);
+}
+function plural(n, one, few, many) {
+  const a = Math.abs(n) % 100, b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b > 1 && b < 5) return few;
+  if (b === 1) return one;
+  return many;
+}
 async function api(path, opts = {}) {
   const res = await fetch(path, {headers: {"Content-Type": "application/json"}, ...opts});
   let data;
@@ -829,90 +1331,276 @@ async function api(path, opts = {}) {
   if (!res.ok || data.ok === false) throw new Error(data.message || `HTTP ${res.status}`);
   return data;
 }
-function refresh() {
-  return api("/api/state").then(s => { state = s; render(); }).catch(e => {
-    document.getElementById("jobs").innerHTML = `<div class="empty">Помилка: ${esc(e.message)}</div>`;
-  });
+function isFiltering() {
+  return !!(document.getElementById("q").value.trim() || document.getElementById("st").value);
 }
-function renderCounts() {
-  const c = state.counts || {total: state.jobs.length, published: 0, ready_to_publish: 0};
-  const f = state.files || {inbox_audio: 0, inbox_unregistered: 0, inbox_bytes: 0,
-                            output_videos: 0, output_bytes: 0};
-  document.getElementById("counts").textContent =
-    `${c.total} задач · на YouTube ${c.published} · готових ${c.ready_to_publish} · ` +
-    `inbox ${f.inbox_audio} (поза чергою ${f.inbox_unregistered}) · аудіо ${fmtSize(f.inbox_bytes)} · ` +
-    `mp4 ${f.output_videos} · відео ${fmtSize(f.output_bytes)}`;
-}
-function visibleJobs() {
-  const q = (document.getElementById("q").value || "").trim().toLowerCase();
-  const st = document.getElementById("st").value;
-  return state.jobs.filter(j =>
-    (!st || j.status === st) &&
-    (!q || `${j.title} ${j.audio} ${j.slug}`.toLowerCase().includes(q)));
-}
-function render() {
-  document.getElementById("quota").textContent = `квота: ${state.quota.used} / ${state.quota.limit}`;
-  const c = state.config;
+function renderHeader() {
+  const q = overview.quota || {used: 0, limit: 0};
+  const c = overview.config || {};
+  const cnt = overview.counts || {};
+  const f = overview.files || {};
+  document.getElementById("quota").textContent = `квота: ${q.used} / ${q.limit}`;
   document.getElementById("cfg").textContent =
-    `${c.llm} · ${c.transcribe} · ffmpeg: ${c.ffmpeg ? "ok" : "немає"}`;
-  renderCounts();
-  const box = document.getElementById("jobs");
-  if (!state.jobs.length) {
-    box.innerHTML = `<div class="empty">Порожньо. Покладіть аудіо в <b>inbox/</b> і натисніть «Сканувати inbox».</div>`;
+    `${c.llm || "—"} · ${c.transcribe || "—"} · ffmpeg: ${c.ffmpeg ? "ok" : "немає"}`;
+  document.getElementById("counts").textContent =
+    `${cnt.total || 0} ${plural(cnt.total || 0, "задача", "задачі", "задач")} · ` +
+    `на YouTube ${cnt.published || 0} · готових ${cnt.ready_to_publish || 0} · ` +
+    `inbox ${f.inbox_audio || 0} (поза чергою ${f.inbox_unregistered || 0}) · аудіо ${fmtSize(f.inbox_bytes || 0)} · ` +
+    `mp4 ${f.output_videos || 0} · відео ${fmtSize(f.output_bytes || 0)}`;
+}
+
+function groupMeta(g) {
+  if (!g.jobs) return `<span class="muted">порожньо</span>`;
+  const bits = [`<b>${g.jobs}</b> ${plural(g.jobs, "задача", "задачі", "задач")}`];
+  const st = g.by_status || {};
+  if (st.new) bits.push(`<span class="warn"><b>${st.new}</b> нових</span>`);
+  if (g.ready) bits.push(`<b>${g.ready}</b> відео`);
+  if (g.published) bits.push(`<span class="ok"><b>${g.published}</b> на YouTube</span>`);
+  if (g.errors) bits.push(`<span class="bad"><b>${g.errors}</b> ${plural(g.errors, "помилка", "помилки", "помилок")}</span>`);
+  if (g.audio_deleted) bits.push(`<span class="warn"><b>${g.audio_deleted}</b> без аудіо</span>`);
+  return bits.join(" · ");
+}
+function groupHtml(g) {
+  const key = esc(g.key);
+  const safe = key.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const sync = g.can_sync
+    ? `<button class="grp-sync" type="button" data-sync="${key}">Синк + відео</button>`
+    : `<span class="hint" style="align-self:center;margin:0 12px">без NotebookLM</span>`;
+  const syncDate = g.can_sync ? fmtDate(g.synced_at) : "";
+  return `<div class="grp" data-key="${key}">
+    <div class="grp-row">
+      <button class="grp-head" type="button" aria-expanded="false" aria-controls="grp-body-${safe}">
+        <span class="chev" aria-hidden="true">▶</span>
+        <span class="grp-main">
+          <span class="grp-title">${esc(g.title)}</span>
+          <span class="grp-meta">${groupMeta(g)}</span>
+        </span>
+        <span class="grp-syncdate" title="${esc(g.synced_at || "")}">${syncDate}</span>
+      </button>
+      ${sync}
+    </div>
+    <div class="grp-body" id="grp-body-${safe}" role="region" hidden></div>
+  </div>`;
+}
+function rowForGroup(key) {
+  return Array.from(document.querySelectorAll(".grp")).find(r => r.dataset.key === key) || null;
+}
+function ensureGroupBody(row) {
+  const body = row.querySelector(".grp-body");
+  if (!body) return null;
+  if (!body.dataset.ready) {
+    body.innerHTML = `<div class="grp-status" role="status" aria-label="Прогрес синку"></div>
+      <div class="grp-jobs"><div class="empty">Завантаження задач…</div></div>`;
+    body.dataset.ready = "1";
+  }
+  return body;
+}
+function setGroupOpen(row, open) {
+  row.classList.toggle("open", open);
+  const head = row.querySelector(".grp-head");
+  if (head) head.setAttribute("aria-expanded", open ? "true" : "false");
+  const body = row.querySelector(".grp-body");
+  if (body) {
+    body.hidden = !open;
+    if (open) ensureGroupBody(row);
+  }
+}
+function openGroup(key, {push = true} = {}) {
+  if (!groupsByKey.has(key)) return;
+  if (openKey === key) {
+    const same = rowForGroup(key);
+    if (same) setGroupOpen(same, true);
+    loadGroupJobs(key);
     return;
   }
-  const jobs = visibleJobs();
+  if (openKey) {
+    const prev = rowForGroup(openKey);
+    if (prev) setGroupOpen(prev, false);
+  }
+  openKey = key;
+  const row = rowForGroup(key);
+  if (row) setGroupOpen(row, true);
+  if (push) history.pushState({group: key}, "", `/?group=${encodeURIComponent(key)}`);
+  if (row) loadGroupJobs(key);
+  if (activeRun && activeRun.notebook_id === key) showSyncStatus(key, activeRun);
+}
+function closeGroup({push = true} = {}) {
+  if (!openKey) return;
+  const row = rowForGroup(openKey);
+  if (row) setGroupOpen(row, false);
+  openKey = null;
+  if (push) history.pushState({}, "", "/");
+}
+function toggleGroup(key) {
+  if (openKey === key) closeGroup();
+  else openGroup(key);
+}
+function renderJobsInto(box, jobs, key) {
   if (!jobs.length) {
-    box.innerHTML = `<div class="empty">Нічого не знайдено за фільтром.</div>`;
+    box.innerHTML = key === "__none__"
+      ? `<div class="empty">Задач без ноутбука немає.</div>`
+      : `<div class="empty">Тут ще немає задач. Натисніть «Синк + відео».</div>`;
     return;
   }
-  box.innerHTML = jobs.map(j => {
-    const badge = `<span class="badge ${j.status}">${UA[j.status] || j.status}</span>`;
-    const yt = j.url ? ` · <a href="${j.url}" target="_blank" style="color:var(--accent)">${j.url}</a>` : "";
-    const flags = [j.has_transcript ? "текст" : "", j.subtitles ? "srt" : "", j.captions ? "субтитри YT" : "",
-                   j.playlist ? "плейлист" : ""].filter(Boolean).join(" · ");
-    const thumb = j.thumbnail ? `<img src="/media/${encodeURI(j.thumbnail)}" alt="">` : "";
-    const preview = j.preview ? `<video controls preload="metadata" src="/media/${encodeURI(j.preview)}"></video>` : "";
-    const audioInfo = j.audio_exists
-      ? `аудіо ${fmtSize(j.audio_size)}`
-      : (j.audio_deleted ? `<span class="gone">аудіо видалено (було скачано)</span>`
-                         : `<span class="gone">аудіо відсутнє</span>`);
-    const videoInfo = j.video_exists
-      ? `відео ${fmtSize(j.video_size)}`
-      : (j.url ? `<span class="gone">відео видалено · на YouTube є</span>` : "відео не відрендерено");
-    const files = `<div class="files">
-      <span class="f">${audioInfo}</span>
-      ${j.audio_exists ? `<button class="ghost danger" onclick="deleteAudio(${j.id})">Видалити аудіо</button>` : ""}
-      ${j.audio_deleted ? `<button class="ghost" onclick="restoreAudio(${j.id})">Відновити аудіо</button>` : ""}
-      <span class="f">${videoInfo}</span>
-      ${j.video_exists ? `<button class="ghost danger" onclick="deleteVideo(${j.id})">Видалити відео</button>` : ""}
-    </div>`;
-    const noAudio = j.audio_exists ? "" : `disabled title="немає аудіо — відновіть його"`;
-    return `<div class="job">
-      <div class="top">${badge}<span class="title">${esc(j.title)}</span>
-        <span class="hint">${fmtDur(j.duration)}</span></div>
-      <div class="sub">#${j.id} · ${esc(j.audio)} · ${esc(j.status)}${yt}${flags ? " · " + flags : ""}</div>
-      ${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}
-      <div class="meta-box">${thumb}<div>${preview}</div></div>
-      ${files}
-      <div class="actions">
-        <button ${noAudio} onclick="act(${j.id},'transcribe')">Транскрипт</button>
-        <button onclick="act(${j.id},'describe')">Метадані LLM</button>
-        <button class="ghost" onclick="editMeta(${j.id})">Редагувати</button>
-        <button class="ghost" ${noAudio} onclick="act(${j.id},'preview')">Прев'ю 20с</button>
-        <button ${noAudio} onclick="act(${j.id},'render',${j.video_exists ? "false" : "true"})">Рендер</button>
-        ${j.url
-          ? `<select class="privacy" id="privacy-${j.id}">
-               <option value="public">public</option>
-               <option value="unlisted">unlisted</option>
-               <option value="private">private</option>
-             </select>
-             <button onclick="publishJob(${j.id})">Змінити приватність</button>`
-          : `<button class="primary" onclick="act(${j.id},'upload')">Опублікувати</button>`}
-        <button class="ghost" onclick="act(${j.id},'reset')">Скинути</button>
-      </div>
-    </div>`;
-  }).join("");
+  box.innerHTML = jobs.map(j => jobCard(j)).join("");
+}
+async function loadGroupJobs(key, {force = false} = {}) {
+  const row = rowForGroup(key);
+  if (!row) return;
+  const body = ensureGroupBody(row);
+  const box = body ? body.querySelector(".grp-jobs") : null;
+  if (!box) return;
+  if (!force && jobsCache.has(key)) {
+    renderJobsInto(box, jobsCache.get(key), key);
+    return;
+  }
+  if (jobsLoading.has(key)) return;
+  jobsLoading.add(key);
+  if (!jobsCache.has(key)) box.innerHTML = `<div class="empty">Завантаження задач…</div>`;
+  try {
+    const data = await api(`/api/groups/${encodeURIComponent(key)}/jobs`);
+    jobsCache.set(key, data.jobs);
+    if (openKey === key) {
+      const current = rowForGroup(key);
+      const currentBox = current ? current.querySelector(".grp-jobs") : null;
+      if (currentBox) renderJobsInto(currentBox, data.jobs, key);
+    }
+  } catch (e) {
+    if (openKey === key) {
+      const current = rowForGroup(key);
+      const currentBox = current ? current.querySelector(".grp-jobs") : null;
+      if (currentBox) currentBox.innerHTML = `<div class="empty bad">Помилка: ${esc(e.message)}</div>`;
+    }
+  } finally {
+    jobsLoading.delete(key);
+  }
+}
+function jobCard(j, showGroup = false) {
+  const badge = `<span class="badge ${j.status}">${UA[j.status] || j.status}</span>`;
+  const yt = j.url ? ` · <a href="${esc(j.url)}" target="_blank" style="color:var(--accent)">${esc(j.url)}</a>` : "";
+  const flags = [j.has_transcript ? "текст" : "", j.subtitles ? "srt" : "", j.captions ? "субтитри YT" : "",
+                 j.playlist ? "плейлист" : ""].filter(Boolean).join(" · ");
+  const nb = showGroup && j.notebook_title ? `<span class="nb-tag">${esc(j.notebook_title)}</span>` : "";
+  const thumb = j.thumbnail ? `<img src="/media/${encodeURI(j.thumbnail)}" alt="">` : "";
+  const preview = j.preview ? `<video controls preload="metadata" src="/media/${encodeURI(j.preview)}"></video>` : "";
+  const audioInfo = j.audio_exists
+    ? `аудіо ${fmtSize(j.audio_size)}`
+    : (j.audio_deleted ? `<span class="gone">аудіо видалено (було скачано)</span>`
+                       : `<span class="gone">аудіо відсутнє</span>`);
+  const videoInfo = j.video_exists
+    ? `відео ${fmtSize(j.video_size)}`
+    : (j.url ? `<span class="gone">відео видалено · на YouTube є</span>` : "відео не відрендерено");
+  const files = `<div class="files">
+    <span class="f">${audioInfo}</span>
+    ${j.audio_exists ? `<button class="ghost danger" onclick="deleteAudio(${j.id})">Видалити аудіо</button>` : ""}
+    ${j.audio_deleted ? `<button class="ghost" onclick="restoreAudio(${j.id})">Відновити аудіо</button>` : ""}
+    <span class="f">${videoInfo}</span>
+    ${j.video_exists ? `<button class="ghost danger" onclick="deleteVideo(${j.id})">Видалити відео</button>` : ""}
+  </div>`;
+  const noAudio = j.audio_exists ? "" : `disabled title="немає аудіо — відновіть його"`;
+  return `<div class="job">
+    <div class="top">${badge}<span class="title">${esc(j.title)}</span>
+      <span class="hint">${fmtDur(j.duration)}</span></div>
+    <div class="sub">#${j.id} · ${esc(j.audio)}${nb} · ${esc(j.status)}${yt}${flags ? " · " + flags : ""}</div>
+    ${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}
+    <div class="meta-box">${thumb}<div>${preview}</div></div>
+    ${files}
+    <div class="actions">
+      <button ${noAudio} onclick="act(${j.id},'transcribe')">Транскрипт</button>
+      <button onclick="act(${j.id},'describe')">Метадані LLM</button>
+      <button class="ghost" onclick="editMeta(${j.id})">Редагувати</button>
+      <button class="ghost" ${noAudio} onclick="act(${j.id},'preview')">Прев'ю 20с</button>
+      <button ${noAudio} onclick="act(${j.id},'render',${j.video_exists ? "false" : "true"})">Рендер</button>
+      ${j.url
+        ? `<select class="privacy" id="privacy-${j.id}">
+             <option value="public">public</option>
+             <option value="unlisted">unlisted</option>
+             <option value="private">private</option>
+           </select>
+           <button onclick="publishJob(${j.id})">Змінити приватність</button>`
+        : `<button class="primary" onclick="act(${j.id},'upload')">Опублікувати</button>
+           ${j.video_exists ? `<button class="ghost" onclick="browserUpload(${j.id})">Через браузер</button>` : ""}`}
+      <button class="ghost" onclick="act(${j.id},'reset')">Скинути</button>
+    </div>
+  </div>`;
+}
+function renderGroups() {
+  if (isFiltering()) { runSearch(); return; }
+  const box = document.getElementById("jobs");
+  document.getElementById("result-info").textContent = "";
+  if (!groups.length) {
+    box.innerHTML = `<div class="empty">Ще немає ноутбуків. Натисніть «Сканувати inbox» або синхронізуйте з NotebookLM.</div>`;
+    return;
+  }
+  box.innerHTML = groups.map(groupHtml).join("");
+  if (openKey) {
+    const row = rowForGroup(openKey);
+    if (row) {
+      setGroupOpen(row, true);
+      loadGroupJobs(openKey);
+    }
+  }
+}
+async function loadGroups({force = false} = {}) {
+  try {
+    const data = await api("/api/groups");
+    groups = data.groups || [];
+    groupsByKey = new Map(groups.map(g => [g.key, g]));
+    if (force) jobsCache.clear();
+    renderGroups();
+    maybeResumeSync();
+  } catch (e) {
+    document.getElementById("jobs").innerHTML = `<div class="empty bad">Помилка: ${esc(e.message)}</div>`;
+  }
+}
+async function loadOverview() {
+  try {
+    const data = await api("/api/overview");
+    overview = data;
+    activeRun = data.sync || null;
+    renderHeader();
+  } catch (e) {
+    setLog([`Помилка: ${e.message}`]);
+  }
+}
+function scheduleSearch() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    if (isFiltering()) runSearch();
+    else loadGroups();
+  }, 250);
+}
+async function runSearch() {
+  const q = document.getElementById("q").value.trim();
+  const st = document.getElementById("st").value;
+  const seq = ++searchSeq;
+  const box = document.getElementById("jobs");
+  const info = document.getElementById("result-info");
+  box.innerHTML = `<div class="empty">Пошук…</div>`;
+  try {
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    if (st) params.set("status", st);
+    const data = await api(`/api/jobs?${params.toString()}`);
+    if (seq !== searchSeq) return;
+    if (!data.jobs.length) {
+      box.innerHTML = `<div class="empty">Нічого не знайдено.</div>`;
+      info.textContent = "Знайдено 0";
+      return;
+    }
+    info.textContent = `Знайдено ${data.total}`;
+    box.innerHTML = data.jobs.map(j => jobCard(j, true)).join("");
+  } catch (e) {
+    if (seq === searchSeq) {
+      box.innerHTML = `<div class="empty bad">Помилка: ${esc(e.message)}</div>`;
+      info.textContent = "";
+    }
+  }
+}
+async function afterChange() {
+  jobsCache.clear();
+  await loadOverview();
+  await loadGroups();
 }
 async function act(id, action, force = false) {
   setBusy(true, action === "render" ? "рендер… це може тривати кілька хвилин"
@@ -928,7 +1616,7 @@ async function act(id, action, force = false) {
     setLog([`Помилка: ${e.message}`]);
   } finally {
     setBusy(false);
-    await refresh();
+    await afterChange();
   }
 }
 async function deleteAudio(id) {
@@ -953,8 +1641,35 @@ async function publishJob(id) {
     setLog([`Помилка: ${e.message}`]);
   } finally {
     setBusy(false);
-    await refresh();
+    await afterChange();
   }
+}
+async function browserUpload(id) {
+  const box = document.getElementById("browser-review");
+  const review = box ? box.checked : false;
+  try {
+    await api(`/api/jobs/${id}/browser-upload${review ? "?review=1" : ""}`, {method: "POST"});
+    setLog(["браузер відкрито. Заповнюю поля у YouTube Studio…",
+            review ? "перевірте відео й натисніть «Опублікувати» у вікні браузера"
+                   : "публікую автоматично…"]);
+    pollBrowser();
+  } catch (e) { setLog([`Помилка: ${e.message}`]); }
+}
+function pollBrowser() {
+  if (browserPoll) return;
+  browserPoll = setInterval(async () => {
+    try {
+      const s = await api("/api/browser");
+      setLog(s.log && s.log.length ? s.log : [s.message || "працюю…"]);
+      if (s.status !== "running") {
+        clearInterval(browserPoll); browserPoll = null;
+        await afterChange();
+      }
+    } catch (e) {
+      clearInterval(browserPoll); browserPoll = null;
+      setLog([`Помилка: ${e.message}`]);
+    }
+  }, 2000);
 }
 async function editMeta(id) {
   try {
@@ -972,19 +1687,148 @@ async function saveMeta(id) {
     document.getElementById("meta-dlg").close();
     setLog([data.message]);
   } catch (e) { setLog([`Помилка: ${e.message}`]); }
-  await refresh();
+  await afterChange();
 }
+function setSyncButtonsDisabled(disabled, runningKey = null) {
+  document.querySelectorAll(".grp-sync").forEach(btn => {
+    btn.disabled = disabled;
+    if (disabled && runningKey && btn.dataset.sync === runningKey) btn.textContent = "Синк…";
+    else btn.textContent = "Синк + відео";
+  });
+}
+function showSyncStatus(key, run, {forceOpen = false} = {}) {
+  const row = rowForGroup(key);
+  if (!row) return;
+  if (openKey !== key) {
+    if (!forceOpen) return;
+    openGroup(key, {push: false});
+  }
+  const body = ensureGroupBody(row);
+  if (!body) return;
+  const status = body.querySelector(".grp-status");
+  if (!status) return;
+  status.classList.add("on");
+  status.classList.remove("running", "done", "error");
+  status.classList.add(run.status);
+  let line = run.message || (run.status === "running" ? "синхронізую…" : "");
+  if (run.status === "error" && run.error) line = `Помилка: ${run.error}`;
+  if (run.total) line += ` · ${run.processed || 0}/${run.total}`;
+  if (run.status === "done" && run.remaining) line += ` · залишилось ${run.remaining}`;
+  let progress = "";
+  if (run.status === "running" && run.total) {
+    const pct = Math.max(0, Math.min(100, Math.round((run.processed || 0) / run.total * 100)));
+    progress = `<div class="bar"><i style="width:${pct}%"></i></div>`;
+  }
+  status.innerHTML = `<div>${esc(line)}</div>${progress}`;
+}
+function stopSyncPolling() {
+  if (syncPoll) { clearInterval(syncPoll); syncPoll = null; }
+}
+function startSyncPolling(key) {
+  stopSyncPolling();
+  syncPoll = setInterval(async () => {
+    try {
+      const data = await api(`/api/groups/${encodeURIComponent(key)}/sync`);
+      if (!data.run) {
+        stopSyncPolling();
+        setSyncButtonsDisabled(false);
+        return;
+      }
+      activeRun = data.run;
+      showSyncStatus(key, activeRun);
+      if (activeRun.status === "running") return;
+      stopSyncPolling();
+      setSyncButtonsDisabled(false);
+      const lines = [activeRun.message || "синк завершено"];
+      if (activeRun.report) {
+        if (activeRun.report.errors && activeRun.report.errors.length) {
+          lines.push(...activeRun.report.errors.map(e => "помилка: " + e));
+        }
+      }
+      if (activeRun.log && activeRun.log.length) lines.push(...activeRun.log.slice(-8));
+      setLog(lines);
+      jobsCache.delete(key);
+      await loadOverview();
+      await loadGroups();
+      showSyncStatus(key, activeRun);
+    } catch (e) {
+      stopSyncPolling();
+      setSyncButtonsDisabled(false);
+      setLog([`Помилка: ${e.message}`]);
+    }
+  }, 1500);
+}
+async function syncGroup(key) {
+  if (activeRun && activeRun.status === "running") {
+    setLog(["інший синк уже виконується — дочекайтеся завершення"]);
+    return;
+  }
+  const g = groupsByKey.get(key);
+  if (!g || !g.can_sync) return;
+  if (!confirm(`Синхронізувати «${g.title}»?\n\n` +
+               "Завантажаться нові аудіо цього ноутбука, потім відрендеряться відео " +
+               "для незавершених задач. Публікації на YouTube не буде. Це може тривати.")) return;
+  openGroup(key, {push: true});
+  setSyncButtonsDisabled(true, key);
+  try {
+    const data = await api(`/api/groups/${encodeURIComponent(key)}/sync`, {method: "POST"});
+    activeRun = data.run;
+    showSyncStatus(key, activeRun, {forceOpen: true});
+    startSyncPolling(key);
+  } catch (e) {
+    setLog([`Помилка: ${e.message}`]);
+    setSyncButtonsDisabled(false);
+  }
+}
+function maybeResumeSync() {
+  const run = overview.sync;
+  if (!run || run.status !== "running" || syncPoll) return;
+  if (!groupsByKey.has(run.notebook_id)) return;
+  activeRun = run;
+  openGroup(run.notebook_id, {push: false});
+  setSyncButtonsDisabled(true, run.notebook_id);
+  showSyncStatus(run.notebook_id, run, {forceOpen: true});
+  startSyncPolling(run.notebook_id);
+}
+function syncFromUrl() {
+  const key = new URLSearchParams(location.search).get("group");
+  if (!key) { closeGroup({push: false}); return; }
+  if (groupsByKey.has(key) && openKey !== key) openGroup(key, {push: false});
+}
+document.getElementById("jobs").addEventListener("click", e => {
+  const sync = e.target.closest(".grp-sync");
+  if (sync) { syncGroup(sync.dataset.sync); return; }
+  const head = e.target.closest(".grp-head");
+  if (head) {
+    const row = head.closest(".grp");
+    if (row) toggleGroup(row.dataset.key);
+  }
+});
+document.getElementById("q").addEventListener("input", scheduleSearch);
+document.getElementById("st").addEventListener("change", () => {
+  if (isFiltering()) runSearch();
+  else loadGroups();
+});
+window.addEventListener("popstate", syncFromUrl);
 document.getElementById("scan").onclick = async () => {
   setBusy(true, "сканую inbox…");
   try {
     const data = await api("/api/scan", {method: "POST"});
     setLog(data.log && data.log.length ? data.log : [data.message]);
   } catch (e) { setLog([`Помилка: ${e.message}`]); }
-  finally { setBusy(false); await refresh(); }
+  finally { setBusy(false); await afterChange(); }
 };
 document.getElementById("toggle-log").onclick = () => document.getElementById("log").classList.toggle("on");
-refresh();
-setInterval(refresh, 15000);
+async function init() {
+  const fromUrl = new URLSearchParams(location.search).get("group");
+  if (fromUrl) openKey = fromUrl;
+  await Promise.all([loadOverview(), loadGroups()]);
+  if (overview.sync) activeRun = overview.sync;
+  maybeResumeSync();
+}
+init();
+setInterval(loadOverview, 15000);
+
 </script>
 </body>
 </html>
@@ -1028,6 +1872,41 @@ NOTEBOOKS_HTML = r"""<!doctype html>
   tr:last-child td { border-bottom:none; }
   .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--err); } .muted { color:var(--muted); }
   .empty { color:var(--muted); padding:40px 0; text-align:center; }
+  .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:14px 0 10px; }
+  .toolbar input[type="search"], .toolbar select { background:var(--panel); color:var(--text);
+    border:1px solid var(--line); border-radius:8px; padding:8px 12px; font:inherit; font-size:14px; }
+  .toolbar input[type="search"] { flex:1; min-width:200px; }
+  .toolbar input[type="search"]:focus, .toolbar select:focus { outline:none; border-color:var(--accent); }
+  .toolbar input:disabled, .toolbar select:disabled { opacity:.5; }
+  .nb-list { display:flex; flex-direction:column; gap:8px; }
+  .nb { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  .nb.hidden { display:none; }
+  .nb-head { width:100%; display:flex; gap:10px; align-items:flex-start; background:none; border:0;
+             border-radius:0; padding:11px 14px; color:inherit; text-align:left; font:inherit; cursor:pointer; }
+  .nb-head:hover { background:var(--panel2); }
+  .nb-head:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+  .chev { color:var(--muted); font-size:11px; line-height:20px; transition:transform .15s ease; }
+  .nb.open .chev { transform:rotate(90deg); }
+  .nb-main { flex:1; min-width:0; }
+  .nb-title { display:block; font-weight:600; font-size:14.5px; line-height:1.3;
+              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .nb-meta { display:block; margin-top:3px; color:var(--muted); font-size:12px; line-height:1.5; }
+  .nb-meta .cnt b { color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; }
+  .nb-meta .cnt.ok b { color:var(--ok); }
+  .nb-meta .cnt.warn b { color:var(--warn); }
+  .nb-meta .cnt.bad b { color:var(--err); }
+  .nb-sync { color:var(--muted); font-size:11.5px; white-space:nowrap; margin-top:3px; }
+  .nb-body { border-top:1px solid var(--line); padding:0 14px 14px; background:rgba(0,0,0,.08); }
+  .nb-body-head { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:12px;
+                  font-size:13px; color:var(--muted); }
+  .nb-body .table-wrap { margin-top:12px; }
+  .nb-body table { background:transparent; }
+  .nb-body .empty { padding:22px 0; }
+  @media (max-width:640px) {
+    .nb-head { flex-wrap:wrap; }
+    .nb-title { white-space:normal; }
+    .nb-sync { margin-left:20px; }
+  }
   #log { margin-top:18px; background:#0b0f13; border:1px solid var(--line); border-radius:10px;
          font:12px/1.5 ui-monospace, monospace; padding:10px 14px; color:#a9bccd; white-space:pre-wrap; display:none; }
   #log.on { display:block; }
@@ -1044,14 +1923,32 @@ NOTEBOOKS_HTML = r"""<!doctype html>
 </header>
 <main>
   <div class="panel" id="daemon">Завантаження…</div>
+  <div class="toolbar">
+    <input id="nb-search" type="search" placeholder="Пошук ноутбука за назвою…" autocomplete="off"
+           aria-label="Пошук ноутбука">
+    <select id="nb-filter" aria-label="Фільтр ноутбуків за станом">
+      <option value="all">Усі ноутбуки</option>
+      <option value="queued">З чергою</option>
+      <option value="errors">З помилками</option>
+      <option value="published">З публікаціями</option>
+      <option value="empty">Без переказів</option>
+    </select>
+    <span class="muted" id="nb-count"></span>
+  </div>
   <div id="content"><div class="empty">Завантаження…</div></div>
   <div id="log"></div>
 </main>
 <script>
 const UA = {new:"нове", transcribed:"транскрипт", described:"метадані", rendered:"відрендерено",
             uploaded:"на YouTube", done:"готово"};
-const parts = location.pathname.split("/").filter(Boolean);
-const nbId = parts.length > 1 ? decodeURIComponent(parts[1]) : null;
+let notebooks = [];
+let byId = new Map();
+let openId = null;
+let itemCache = new Map();
+let loadingItems = new Set();
+let query = "";
+let filter = "all";
+let firstLoad = true;
 
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function fmtDur(s) {
@@ -1064,6 +1961,18 @@ function fmtTime(iso) {
   if (!iso) return "зараз";
   const d = new Date(iso);
   return d.toLocaleString("uk-UA", {day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit"});
+}
+function fmtDate(iso) {
+  if (!iso) return "не синкався";
+  const d = String(iso).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(d) ? `синк ${d.split("-").reverse().join(".")}` : esc(iso);
+}
+function plural(n, one, few, many) {
+  const a = Math.abs(n) % 100, b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b > 1 && b < 5) return few;
+  if (b === 1) return one;
+  return many;
 }
 async function api(path, opts = {}) {
   const res = await fetch(path, {headers: {"Content-Type": "application/json"}, ...opts});
@@ -1090,29 +1999,39 @@ async function loadDaemon() {
       stat("Наступне вікно", esc(fmtTime(d.next_upload_at)));
   } catch (e) { el.innerHTML = `<span class="bad">Помилка: ${esc(e.message)}</span>`; }
 }
-async function loadList() {
-  const data = await api("/api/notebooks");
-  if (!data.notebooks.length)
-    return `<div class="empty">Ще немає ноутбуків. Натисніть «Синк (план)», щоб побачити, що є в NotebookLM.</div>`;
-  const rows = data.notebooks.map(n => `<tr>
-      <td><a href="/notebooks/${encodeURIComponent(n.id)}">${esc(n.title)}</a></td>
-      <td class="n">${n.downloaded}</td>
-      <td class="n ${n.deleted ? "warn" : ""}">${n.deleted}</td>
-      <td class="n">${n.queued}</td>
-      <td class="n ok">${n.published}</td>
-      <td class="n ${n.errors ? "bad" : ""}">${n.errors}</td>
-      <td class="n ${n.missing ? "warn" : ""}">${n.missing}</td>
-      <td class="muted">${esc((n.synced_at || "").slice(0, 16).replace("T", " "))}</td>
-    </tr>`).join("");
-  return `<h2>Ноутбуки NotebookLM</h2><div class="table-wrap"><table>
-    <tr><th>Ноутбук</th><th>Скачано</th><th>Аудіо видалено</th><th>У черзі</th><th>Опубліковано</th><th>Помилки</th><th>Зникли</th><th>Синк</th></tr>
-    ${rows}</table></div>`;
+function counters(n) {
+  const bits = [`<span class="cnt"><b>${n.downloaded}</b> ${plural(n.downloaded, "переказ", "перекази", "переказів")}</span>`];
+  if (n.queued) bits.push(`<span class="cnt warn"><b>${n.queued}</b> у черзі</span>`);
+  if (n.published) bits.push(`<span class="cnt ok"><b>${n.published}</b> на YouTube</span>`);
+  if (n.errors) bits.push(`<span class="cnt bad"><b>${n.errors}</b> ${plural(n.errors, "помилка", "помилки", "помилок")}</span>`);
+  if (n.missing) bits.push(`<span class="cnt warn"><b>${n.missing}</b> ${plural(n.missing, "зник", "зникли", "зникли")}</span>`);
+  if (n.deleted) bits.push(`<span class="cnt warn"><b>${n.deleted}</b> без аудіо</span>`);
+  return bits.join(" · ");
 }
-async function loadOne(id) {
-  const data = await api(`/api/notebooks/${encodeURIComponent(id)}`);
-  const nb = data.notebook;
-  const link = nb.url ? ` · <a href="${esc(nb.url)}" target="_blank">відкрити в NotebookLM</a>` : "";
-  if (!data.items.length) return `<h2>${esc(nb.title)}${link}</h2><div class="empty">Переказів ще немає.</div>`;
+function rowHtml(n) {
+  const id = esc(n.id);
+  return `<div class="nb" data-id="${id}">
+    <button class="nb-head" type="button" id="nb-head-${id}" aria-expanded="false"
+            aria-controls="nb-body-${id}">
+      <span class="chev" aria-hidden="true">▶</span>
+      <span class="nb-main">
+        <span class="nb-title">${esc(n.title)}</span>
+        <span class="nb-meta">${counters(n)}</span>
+      </span>
+      <span class="nb-sync" title="${esc(n.synced_at || "")}">${fmtDate(n.synced_at)}</span>
+    </button>
+    <div class="nb-body" id="nb-body-${id}" role="region" aria-labelledby="nb-head-${id}" hidden></div>
+  </div>`;
+}
+function itemsHtml(data) {
+  const nb = data.notebook || {};
+  const link = nb.url
+    ? `<a href="${esc(nb.url)}" target="_blank" rel="noreferrer">відкрити в NotebookLM</a>` : "";
+  const count = `<b>${data.items.length}</b> ${plural(data.items.length, "переказ", "перекази", "переказів")}`;
+  if (!data.items.length) {
+    return `<div class="nb-body-head"><span>${count}</span><span class="spacer"></span>${link}</div>
+      <div class="empty">Переказів ще немає.</div>`;
+  }
   const rows = data.items.map(i => {
     const status = i.job_status ? (UA[i.job_status] || i.job_status) : "без задачі";
     const audio = i.audio_deleted
@@ -1120,24 +2039,158 @@ async function loadOne(id) {
       : (i.audio_exists ? "" : `<span class="warn">аудіо відсутнє</span>`);
     const state = [i.state === "missing" ? `<span class="warn">зник з NotebookLM</span>` : "", audio]
       .filter(Boolean).join(" · ");
-    const yt = i.url ? `<a href="${esc(i.url)}" target="_blank">${esc(i.url.replace("https://", ""))}</a>` : "—";
+    const yt = i.url
+      ? `<a href="${esc(i.url)}" target="_blank" rel="noreferrer">${esc(i.url.replace("https://", ""))}</a>`
+      : "—";
     return `<tr>
-      <td>${esc(i.title)}<div class="muted" style="font-size:12px">${esc((i.created_at || "").slice(0, 10))} ${state}</div></td>
+      <td>${esc(i.title)}<div class="muted" style="font-size:12px">${esc((i.created_at || "").slice(0, 10))}${state ? " · " + state : ""}</div></td>
       <td class="n">${fmtDur(i.duration)}</td>
       <td>${esc(status)}${i.job_id ? ` <span class="muted">#${i.job_id}</span>` : ""}</td>
       <td>${yt}</td>
       <td class="bad">${esc(i.error || "")}</td>
     </tr>`;
   }).join("");
-  return `<h2>${esc(nb.title)}${link}</h2><div class="table-wrap"><table>
-    <tr><th>Переказ</th><th>Тривалість</th><th>Задача</th><th>YouTube</th><th>Помилка</th></tr>
-    ${rows}</table></div>`;
+  return `<div class="nb-body-head"><span>${count}</span><span class="spacer"></span>${link}</div>
+    <div class="table-wrap"><table>
+      <tr><th>Переказ</th><th>Тривалість</th><th>Задача</th><th>YouTube</th><th>Помилка</th></tr>
+      ${rows}</table></div>`;
 }
-async function refresh() {
+function rowFor(id) {
+  return Array.from(document.querySelectorAll(".nb")).find(r => r.dataset.id === id) || null;
+}
+function setExpanded(row, open) {
+  row.classList.toggle("open", open);
+  const head = row.querySelector(".nb-head");
+  if (head) head.setAttribute("aria-expanded", open ? "true" : "false");
+  const body = row.querySelector(".nb-body");
+  if (body) body.hidden = !open;
+}
+function updateTitle() {
+  const nb = openId ? byId.get(openId) : null;
+  document.title = nb ? `${nb.title} · Ноутбуки · AudioTube Studio` : "Ноутбуки · AudioTube Studio";
+}
+function matchesFilter(n) {
+  if (filter === "queued") return n.queued > 0;
+  if (filter === "errors") return n.errors > 0;
+  if (filter === "published") return n.published > 0;
+  if (filter === "empty") return n.downloaded === 0;
+  return true;
+}
+function applyFilter() {
+  const q = query.trim().toLowerCase();
+  let shown = 0;
+  document.querySelectorAll(".nb").forEach(row => {
+    const n = byId.get(row.dataset.id);
+    if (!n) return;
+    const ok = matchesFilter(n) && (!q || String(n.title || "").toLowerCase().includes(q));
+    row.classList.toggle("hidden", !ok);
+    if (ok) shown++;
+  });
+  const el = document.getElementById("nb-count");
+  if (el) el.textContent = notebooks.length ? `Показано ${shown} з ${notebooks.length}` : "";
+}
+function renderList() {
+  const box = document.getElementById("content");
+  const search = document.getElementById("nb-search");
+  const select = document.getElementById("nb-filter");
+  const has = notebooks.length > 0;
+  if (search) search.disabled = !has;
+  if (select) select.disabled = !has;
+  if (!has) {
+    box.innerHTML = `<div class="empty">Ще немає ноутбуків. Натисніть «Синк (план)», щоб побачити, що є в NotebookLM.</div>`;
+    if (document.getElementById("nb-count")) document.getElementById("nb-count").textContent = "";
+    return;
+  }
+  box.innerHTML = `<div class="nb-list" id="nb-list">${notebooks.map(rowHtml).join("")}</div>`;
+  const row = openId ? rowFor(openId) : null;
+  if (row) {
+    setExpanded(row, true);
+    ensureItems(openId);
+  }
+  applyFilter();
+  updateTitle();
+}
+async function ensureItems(id, {force = false} = {}) {
+  const row = rowFor(id);
+  if (!row) return;
+  const body = row.querySelector(".nb-body");
+  if (!body) return;
+  if (!force && itemCache.has(id)) {
+    body.innerHTML = itemsHtml(itemCache.get(id));
+    return;
+  }
+  if (loadingItems.has(id)) return;
+  loadingItems.add(id);
+  body.innerHTML = `<div class="empty">Завантаження переказів…</div>`;
+  try {
+    const data = await api(`/api/notebooks/${encodeURIComponent(id)}`);
+    itemCache.set(id, data);
+    if (openId === id) body.innerHTML = itemsHtml(data);
+  } catch (e) {
+    if (openId === id) {
+      body.innerHTML = `<div class="empty bad">Помилка: ${esc(e.message)}<br>
+        <button type="button" data-retry="${esc(id)}">Повторити</button></div>`;
+    }
+  } finally {
+    loadingItems.delete(id);
+  }
+}
+function notebookFromPath() {
+  const parts = location.pathname.split("/").filter(Boolean);
+  return parts[0] === "notebooks" && parts.length > 1 ? decodeURIComponent(parts[1]) : null;
+}
+function openNotebook(id, {push = true} = {}) {
+  if (!byId.has(id) || openId === id) return;
+  const prev = openId ? rowFor(openId) : null;
+  if (prev) setExpanded(prev, false);
+  openId = id;
+  const row = rowFor(id);
+  if (row) setExpanded(row, true);
+  if (push) history.pushState({notebook: id}, "", `/notebooks/${encodeURIComponent(id)}`);
+  ensureItems(id);
+  updateTitle();
+}
+function closeNotebook({push = true} = {}) {
+  if (!openId) return;
+  const row = rowFor(openId);
+  if (row) setExpanded(row, false);
+  openId = null;
+  if (push) history.pushState({}, "", "/notebooks");
+  updateTitle();
+}
+function toggleNotebook(id) {
+  if (openId === id) closeNotebook();
+  else openNotebook(id);
+}
+function syncFromLocation() {
+  const id = notebookFromPath();
+  if (id === openId) return;
+  if (id && byId.has(id)) openNotebook(id, {push: false});
+  else if (!id) closeNotebook({push: false});
+}
+async function refresh({force = false} = {}) {
+  if (force) itemCache.clear();
   loadDaemon();
   const box = document.getElementById("content");
-  try { box.innerHTML = nbId ? await loadOne(nbId) : await loadList(); }
-  catch (e) { box.innerHTML = `<div class="empty bad">Помилка: ${esc(e.message)}</div>`; }
+  try {
+    const data = await api("/api/notebooks");
+    notebooks = data.notebooks;
+    byId = new Map(notebooks.map(n => [n.id, n]));
+    const fromUrl = notebookFromPath();
+    if (fromUrl && byId.has(fromUrl)) {
+      openId = fromUrl;
+    } else {
+      if (openId && !byId.has(openId)) openId = null;
+      if (fromUrl) {
+        if (firstLoad) setLog([`Ноутбук ${fromUrl} не знайдено — можливо, його видалено.`]);
+        history.replaceState({}, "", "/notebooks");
+      }
+    }
+    firstLoad = false;
+    renderList();
+  } catch (e) {
+    box.innerHTML = `<div class="empty bad">Помилка: ${esc(e.message)}</div>`;
+  }
 }
 async function runSync(dryRun) {
   const buttons = [document.getElementById("sync-plan"), document.getElementById("sync-run")];
@@ -1148,8 +2201,27 @@ async function runSync(dryRun) {
     const items = data.report.items.map(i => `${i.action.padEnd(9)} ${i.notebook} — ${i.title}${i.message ? " (" + i.message + ")" : ""}`);
     setLog([data.message, ...items, ...data.report.errors.map(e => "помилка: " + e)]);
   } catch (e) { setLog([`Помилка: ${e.message}`]); }
-  finally { buttons.forEach(b => b.disabled = false); refresh(); }
+  finally { buttons.forEach(b => b.disabled = false); refresh({force: true}); }
 }
+document.getElementById("content").addEventListener("click", e => {
+  const head = e.target.closest(".nb-head");
+  if (head) {
+    const row = head.closest(".nb");
+    if (row) toggleNotebook(row.dataset.id);
+    return;
+  }
+  const retry = e.target.closest("[data-retry]");
+  if (retry) ensureItems(retry.dataset.retry, {force: true});
+});
+document.getElementById("nb-search").addEventListener("input", e => {
+  query = e.target.value;
+  applyFilter();
+});
+document.getElementById("nb-filter").addEventListener("change", e => {
+  filter = e.target.value;
+  applyFilter();
+});
+window.addEventListener("popstate", syncFromLocation);
 document.getElementById("sync-plan").onclick = () => runSync(true);
 document.getElementById("sync-run").onclick = () => {
   if (confirm("Запустити справжній синк? Нові перекази буде скачано (не більше max_per_run).")) runSync(false);

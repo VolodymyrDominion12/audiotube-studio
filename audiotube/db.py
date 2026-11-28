@@ -206,6 +206,37 @@ class Database:
         r = self.conn.execute("SELECT id FROM jobs WHERE audio=?", (str(audio.resolve()),)).fetchone()
         return r["id"] if r else None
 
+    def job_notebooks(self) -> dict[int, tuple[str, str]]:
+        """Мапа job_id -> (notebook_id, назва ноутбука) для групування черги (spec 017)."""
+        rows = self.conn.execute(
+            """SELECT a.job_id, a.notebook_id, n.title
+               FROM artifacts a JOIN notebooks n ON n.id = a.notebook_id
+               WHERE a.job_id IS NOT NULL
+               ORDER BY a.id"""
+        ).fetchall()
+        result: dict[int, tuple[str, str]] = {}
+        for row in rows:
+            result.setdefault(int(row["job_id"]), (row["notebook_id"], row["title"]))
+        return result
+
+    def jobs_for_notebook(self, notebook_id: str | None) -> list[Job]:
+        """Задачі ноутбука; `None` — задачі без жодного привʼязаного артефакту."""
+        if notebook_id is None:
+            rows = self.conn.execute(
+                """SELECT * FROM jobs j
+                   WHERE NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.job_id = j.id)
+                   ORDER BY j.id"""
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """SELECT j.* FROM jobs j
+                   WHERE EXISTS (SELECT 1 FROM artifacts a
+                                 WHERE a.job_id = j.id AND a.notebook_id = ?)
+                   ORDER BY j.id""",
+                (notebook_id,),
+            ).fetchall()
+        return [Job.from_row(r) for r in rows]
+
     # --- NotebookLM --------------------------------------------------------
     def notebooks(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM notebooks ORDER BY title").fetchall()

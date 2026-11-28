@@ -111,6 +111,14 @@ youtube:
   captions_name: Українська
   captions_cost: 400                       # вартість captions.insert у квоті
   auto_upload: false                       # `run` одразу завантажує після рендеру
+  # Браузерна публікація через YouTube Studio UI (spec 016), без Data API і квоти
+  browser:
+    profile_dir: data/browser/youtube      # окремий профіль Chrome; не ваш основний
+    chrome: null                           # шлях до Chrome; null = автопошук
+    login_timeout: 900                     # секунд на ручний вхід у Google
+    timeout: 60                            # секунд на один елемент UI
+    publish_timeout: 1800                  # секунд очікування в --review
+    keep_open: false                       # не закривати вікно після роботи
 
 description:
   footer: |

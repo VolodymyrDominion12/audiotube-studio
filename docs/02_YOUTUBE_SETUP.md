@@ -74,6 +74,21 @@ audiotube auth
 
 **Позначка AI-контенту.** `youtube.contains_synthetic_media: true` у конфігу виставляє відповідну позначку при завантаженні.
 
+## Альтернатива без API: браузерний режим (spec 016)
+
+Якщо OAuth-застосунок, аудит або квота не підходять, можна публікувати через справжній
+Chrome і UI YouTube Studio:
+
+```bash
+audiotube browser-auth        # один раз: ручний вхід у Google у вікні Chrome
+audiotube browser-upload      # усі відрендерені; типово private
+```
+
+Окремий профіль — `data/browser/youtube/`, пароль програма не бачить. Data API не
+використовується, квота не списується. Режим інтерактивний (не для демона/systemd),
+`publish_at` і плейлисти не підтримуються; обкладинка й субтитри — best-effort.
+Деталі — [07_COMMANDS.md](07_COMMANDS.md), розд. 3.
+
 ## Безпека
 
 `data/client_secret.json` і `data/token.json` — це доступ до вашого каналу. Не комітьте їх у git (вони вже в `.gitignore`).

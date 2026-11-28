@@ -99,6 +99,17 @@ class PipelineCfg(BaseModel):
     auto_render: bool = True
 
 
+class BrowserCfg(BaseModel):
+    """Браузерна публікація через YouTube Studio UI (spec 016)."""
+
+    profile_dir: str = "data/browser/youtube"  # окремий профіль Chrome, не основний
+    chrome: str | None = None  # шлях до Chrome; null = автопошук
+    login_timeout: int = Field(900, ge=30)  # секунд на ручний вхід у Google
+    timeout: int = Field(60, ge=5)  # секунд на один елемент UI
+    publish_timeout: int = Field(1800, ge=60)  # секунд очікування в --review
+    keep_open: bool = False  # не закривати вікно після роботи
+
+
 class YouTubeCfg(BaseModel):
     client_secret: str = "data/client_secret.json"
     token: str = "data/token.json"
@@ -117,6 +128,7 @@ class YouTubeCfg(BaseModel):
     captions_name: str = "Українська"
     captions_cost: int = 400
     auto_upload: bool = False
+    browser: BrowserCfg = Field(default_factory=BrowserCfg)
 
 
 class DescriptionCfg(BaseModel):

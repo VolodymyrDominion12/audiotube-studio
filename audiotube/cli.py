@@ -253,6 +253,43 @@ def cmd_auth(args) -> int:
     return 0
 
 
+def cmd_browser_auth(args) -> int:
+    """spec 016: ручний вхід у Google у справжньому Chrome із виділеним профілем."""
+    from audiotube.browser_publish import BrowserPublisher
+
+    cfg = _cfg(args)
+    pipe = Pipeline(cfg)
+    pub = BrowserPublisher(pipe)
+    try:
+        name = pub.sign_in(interactive=True)
+        print(f"авторизовано. Канал: {name}")
+        print(f"профіль: {cfg.path(cfg.youtube.browser.profile_dir)}")
+        return 0
+    finally:
+        pub.close(keep_open=args.keep_open or cfg.youtube.browser.keep_open)
+
+
+def cmd_browser_upload(args) -> int:
+    """spec 016: публікація через UI YouTube Studio, без Data API і квоти."""
+    from audiotube.browser_publish import BrowserPublisher
+
+    pipe = Pipeline(_cfg(args))
+    jobs = pipe.select(args.ids, ("rendered", "uploaded"))
+    if not jobs:
+        print("немає відрендерених відео для браузерної публікації")
+        return 0
+    pub = BrowserPublisher(pipe)
+    failed = 0
+    try:
+        for job in jobs:
+            res = pub.publish(job, review=args.review, dry_run=args.dry_run)
+            failed += bool(res.error)
+    finally:
+        pub.close(keep_open=args.keep_open or pipe.cfg.youtube.browser.keep_open)
+    print(f"браузерна публікація: успішно {len(jobs) - failed}, помилок {failed}")
+    return 1 if failed else 0
+
+
 def cmd_upload(args) -> int:
     pipe = Pipeline(_cfg(args))
     jobs = pipe.select(args.ids, ("rendered", "uploaded"))
@@ -630,6 +667,16 @@ def cmd_doctor(args) -> int:
     if not token.exists() or not secret.exists():
         problems += 1
 
+    from audiotube.browser_publish import find_chrome
+
+    chrome = find_chrome(cfg)
+    has_playwright = importlib.util.find_spec("playwright") is not None
+    line(
+        None,
+        "браузерна публікація (spec 016)",
+        f"Chrome: {chrome or 'не знайдено'}; Playwright: {'є' if has_playwright else 'немає'}",
+    )
+
     from audiotube.notify import telegram_status
 
     tg_ok, tg_note = telegram_status(cfg)
@@ -716,6 +763,22 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_render)
 
     sub.add_parser("auth", help="авторизація YouTube").set_defaults(func=cmd_auth)
+
+    s = sub.add_parser("browser-auth", help="вхід у Google у справжньому браузері (spec 016)")
+    s.add_argument("--keep-open", action="store_true", help="не закривати Chrome після входу")
+    s.set_defaults(func=cmd_browser_auth)
+
+    s = sub.add_parser(
+        "browser-upload", help="завантажити відео через UI YouTube Studio, без Data API"
+    )
+    s.add_argument("ids", nargs="*", type=int)
+    s.add_argument(
+        "--review", action="store_true",
+        help="заповнити все й зупинитися: кнопку «Опублікувати» натискає людина",
+    )
+    s.add_argument("--dry-run", action="store_true", help="заповнити форму, не публікувати")
+    s.add_argument("--keep-open", action="store_true", help="не закривати Chrome після роботи")
+    s.set_defaults(func=cmd_browser_upload)
 
     s = sub.add_parser("upload", help="завантажити на YouTube, додати субтитри й плейлист")
     s.add_argument("ids", nargs="*", type=int)

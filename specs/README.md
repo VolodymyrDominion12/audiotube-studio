@@ -54,6 +54,9 @@ draft → approved → in-progress → implemented
 | 012 | [Нічний пакетний прогін](012-nightly-run/spec.md) | implemented | `cli.py`, `pipeline.py` |
 | 013 | [Дорендер аудіо без відео](013-missing-video-render/spec.md) | implemented | `cli.py` |
 | 014 | [Локальне очищення аудіо та відео](014-local-file-cleanup/spec.md) | implemented | `webui.py`, `db.py`, `sync.py` |
+| 015 | [«Ноутбуки»: акордеон із лінивим завантаженням переказів](015-webui-notebook-accordion/spec.md) | implemented | `webui.py` |
+| 016 | [Публікація через справжній браузер](016-browser-publish/spec.md) | implemented | `browser_publish.py`, `cli.py`, `webui.py` |
+| 017 | [Головна сторінка: групи ноутбуків, ліниві задачі, синк ноутбука](017-webui-notebook-groups/spec.md) | implemented | `webui.py`, `db.py` |
 
 Спеки 001–004 написані **після** коду (reverse-engineered): вони фіксують поточну поведінку
 як контракт, щоб подальші зміни не ламали її непомітно.
