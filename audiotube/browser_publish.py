@@ -297,7 +297,6 @@ class ChromeSession:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-search-engine-choice-screen",
-            "--disable-blink-features=AutomationControlled",
             "--start-maximized",
             *extra,
             "about:blank",
@@ -438,7 +437,9 @@ class ChromeSession:
             return None
         try:
             path = self.screenshots_dir() / f"{datetime.now():%Y%m%d-%H%M%S}-{label}.png"
-            self._page.screenshot(path=str(path), full_page=False)
+            self._page.screenshot(
+                path=str(path), full_page=False, timeout=10_000, animations="disabled"
+            )
             return path
         except Exception:  # noqa: BLE001 — скриншот не має ховати основну помилку
             return None
@@ -601,11 +602,20 @@ class PlaywrightStudio:
                     self.page.keyboard.insert_text(line)
 
     def _dialog(self):
-        return self.page.locator("ytcp-uploads-dialog, ytcp-upload-dialog").first
+        """Видима частина діалогу: хост `ytcp-uploads-dialog` має height:0, тому не годиться."""
+        return self.page.locator(
+            "ytcp-uploads-dialog tp-yt-paper-dialog, "
+            "ytcp-upload-dialog tp-yt-paper-dialog"
+        ).first
 
     def _screenshot(self, label: str) -> str:
         path = self.session.screenshot(label)
         return f" Скриншот: {path}" if path else ""
+
+    def _ensure_open(self, where: str = "роботи") -> None:
+        is_closed = getattr(self.page, "is_closed", None)
+        if callable(is_closed) and is_closed():
+            raise BrowserError(f"вікно браузера закрито під час {where}")
 
     # --- вхід -------------------------------------------------------------
     def sign_in(self, *, interactive: bool = True) -> str:
@@ -664,17 +674,22 @@ class PlaywrightStudio:
             self.log(f"! {warning}")
         try:
             self._open_upload_dialog()
-            self._select_file(video)
-            self._wait_details()
-            self._fill_details(plan)
-            self._advance_to_visibility(plan.privacy)
-            self._select_visibility(plan)
-
             if dry_run:
+                # Не вибираємо файл: інакше Studio починає 100+ МБ завантаження й показує
+                # тимчасове посилання, яке легко сплутати з уже опублікованим відео.
                 shot = self.session.screenshot("dry-run")
                 suffix = f" Скриншот: {shot}" if shot else ""
-                self.log("dry-run: поля заповнено, кнопку публікації не натиснуто" + suffix)
+                self.log(
+                    "dry-run: доступ до Studio є; файл не вибрано, щоб не створювати чернетку"
+                    + suffix
+                )
                 return PublishOutcome(published=False, warnings=list(plan.warnings))
+
+            self._select_file(video)
+            self._wait_details()
+            thumbnail_done = bool(self._fill_details(plan))
+            self._advance_to_visibility(plan.privacy)
+            self._select_visibility(plan)
 
             # Браузерне завантаження йде, лише поки відкрите вікно: дотискати «Опублікувати»
             # раніше 100% означає обірвати файл на півдорозі (див. spec 016, R2).
@@ -682,16 +697,18 @@ class PlaywrightStudio:
                 self.log("! не дочекалися 100% завантаження — публікую те, що встигло")
 
             if review:
+                shot = self.session.screenshot("review")
+                suffix = f" Скриншот: {shot}" if shot else ""
                 self.log(
-                    "перевірте відео у вікні браузера й натисніть «Опублікувати» "
-                    f"(чекаю до {self.cfg.youtube.browser.publish_timeout} с)"
+                    "перевірте відео, натисніть «Опублікувати» (або «Зберегти») і закрийте "
+                    f"діалог; чекаю до {self.cfg.youtube.browser.publish_timeout} с" + suffix
                 )
                 timeout = float(self.cfg.youtube.browser.publish_timeout)
             else:
                 self._click_done()
                 timeout = 900.0
 
-            video_id = self._wait_video_id(plan, timeout=timeout)
+            video_id = self._wait_video_id(plan, timeout=timeout, require_close=review)
             if not video_id:
                 raise VideoIdUnknown(
                     "відео, ймовірно, опубліковано, але id не прочитано. "
@@ -700,14 +717,17 @@ class PlaywrightStudio:
                 )
             self.log(f"відео опубліковано: https://youtu.be/{video_id}")
             out = PublishOutcome(
-                video_id=video_id, published=True, warnings=list(plan.warnings)
+                video_id=video_id,
+                published=True,
+                thumbnail=thumbnail_done,
+                warnings=list(plan.warnings),
             )
             self._finish_assets(video_id, plan, out)
             return out
         except VideoIdUnknown:
             raise
         except Exception as exc:
-            shot = self._screenshot("publish-error")
+            shot = "" if "Скриншот:" in str(exc) else self._screenshot("publish-error")
             raise BrowserError(f"{exc}{shot}") from exc
 
     def finish(
@@ -726,7 +746,7 @@ class PlaywrightStudio:
         return out
 
     def _finish_assets(self, video_id: str, plan: PublishPlan, out: PublishOutcome) -> None:
-        if plan.thumbnail:
+        if plan.thumbnail and not out.thumbnail:
             out.thumbnail = self._set_thumbnail(video_id, plan.thumbnail, out.warnings)
         if plan.captions:
             out.captions = self._set_captions(video_id, plan.captions, out.warnings)
@@ -738,7 +758,11 @@ class PlaywrightStudio:
         self.page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=90_000)
         self.session.dismiss_consent()
         try:
-            self._wait_visible("ytcp-uploads-dialog, ytcp-upload-dialog", timeout=120)
+            self._wait_visible(
+                "ytcp-uploads-dialog tp-yt-paper-dialog, "
+                "ytcp-upload-dialog tp-yt-paper-dialog",
+                timeout=120,
+            )
         except Exception as exc:
             raise BrowserError(
                 "не відкрився діалог завантаження YouTube Studio. "
@@ -746,12 +770,44 @@ class PlaywrightStudio:
             ) from exc
 
     def _select_file(self, video: Path) -> None:
-        dialog = self._dialog()
-        inputs = dialog.locator('input[type="file"]')
-        if not inputs.count():
-            inputs = self.page.locator('input[type="file"]')
-        inputs.first.set_input_files(str(video))
+        # Playwright відмовляється передавати файли >50 МБ у браузер, підключений
+        # через CDP («not co-located»). Chrome локальний, тож ставимо шлях через
+        # DOM.setFileInputFiles — без копіювання байтів через протокол.
+        try:
+            self._set_file_via_cdp(video)
+        except Exception as exc:  # noqa: BLE001 — фолбек для малих файлів
+            self.log(f"! CDP-вибір файлу не спрацював ({exc}); пробую Playwright")
+            dialog = self._dialog()
+            inputs = dialog.locator('input[type="file"]')
+            if not inputs.count():
+                inputs = self.page.locator('input[type="file"]')
+            inputs.first.set_input_files(str(video))
         self.log("файл передано в Studio, чекаю форму деталей…")
+
+    def _set_file_via_cdp(self, video: Path) -> None:
+        cdp = self.page.context.new_cdp_session(self.page)
+        try:
+            root = cdp.send("DOM.getDocument", {"depth": 0})["root"]["nodeId"]
+            node_id = 0
+            for selector in (
+                "ytcp-uploads-file-picker input[type=file]",
+                "ytcp-uploads-dialog input[type=file]",
+                "input[type=file]",
+            ):
+                result = cdp.send(
+                    "DOM.querySelector", {"nodeId": root, "selector": selector}
+                )
+                node_id = int(result.get("nodeId") or 0)
+                if node_id:
+                    break
+            if not node_id:
+                raise BrowserError("не знайдено поле вибору відеофайлу")
+            cdp.send(
+                "DOM.setFileInputFiles",
+                {"files": [str(video.resolve())], "nodeId": node_id},
+            )
+        finally:
+            cdp.detach()
 
     def _wait_details(self) -> None:
         try:
@@ -760,7 +816,7 @@ class PlaywrightStudio:
             self._wait_visible("ytcp-video-metadata-editor-basics", timeout=60)
         time.sleep(0.5)
 
-    def _fill_details(self, plan: PublishPlan) -> None:
+    def _fill_details(self, plan: PublishPlan) -> bool:
         page = self.page
         title = page.locator("#title-textarea #textbox").first
         title.wait_for(state="visible", timeout=30_000)
@@ -770,11 +826,30 @@ class PlaywrightStudio:
         if description.count():
             self._fill_editable(description, plan.description)
 
+        thumbnail_ok = False
+        if plan.thumbnail:
+            try:
+                thumbnail_ok = self._upload_thumbnail_in_scope(
+                    plan.thumbnail, scope=self._dialog()
+                )
+            except Exception as exc:  # noqa: BLE001 — спробуємо на /edit після публікації
+                self.log(
+                    f"! не вдалося додати обкладинку у діалозі ({exc}) — спробую після публікації"
+                )
+            else:
+                if thumbnail_ok:
+                    self.log("обкладинку додано у форму створення")
+                else:
+                    self.log(
+                        "! не вдалося додати обкладинку у діалозі — спробую після публікації"
+                    )
+
         self._set_made_for_kids(plan.made_for_kids)
         self._show_more()
         self._fill_tags(plan.tags)
         if plan.synthetic:
             self._set_synthetic_disclosure()
+        return thumbnail_ok
 
     def _set_made_for_kids(self, made_for_kids: bool) -> None:
         name = "VIDEO_MADE_FOR_KIDS_MFK" if made_for_kids else "VIDEO_MADE_FOR_KIDS_NOT_MFK"
@@ -855,10 +930,12 @@ class PlaywrightStudio:
             self.log(f"! позначку AI-контенту не встановлено: {exc}")
 
     def _next(self) -> None:
+        self._ensure_open("переходу до наступного кроку")
         button = self._dialog().locator("#next-button").first
         button.wait_for(state="visible", timeout=30_000)
         deadline = time.monotonic() + 180
         while button.is_disabled() and time.monotonic() < deadline:
+            self._ensure_open("очікування кнопки «Далі»")
             time.sleep(0.5)
         button.click()
         time.sleep(0.8)
@@ -868,6 +945,7 @@ class PlaywrightStudio:
         name = PRIVACY_RADIO.get(privacy, "PRIVATE")
         radio = self._dialog().locator(f'tp-yt-paper-radio-button[name="{name}"]')
         for _ in range(6):
+            self._ensure_open("переходу до кроку «Приватність»")
             if radio.count() and radio.first.is_visible():
                 return
             self._next()
@@ -875,12 +953,14 @@ class PlaywrightStudio:
 
     def _wait_upload_complete(self, timeout: float | None = None) -> bool:
         """Чекає, доки Studio не завершить завантаження файлу (R2)."""
+        self._ensure_open("очікування завершення завантаження")
         timeout = timeout or float(self.cfg.youtube.browser.publish_timeout)
         deadline = time.monotonic() + timeout
         no_progress_until = time.monotonic() + 60
         last = ""
         seen = False
         while time.monotonic() < deadline:
+            self._ensure_open("очікування завершення завантаження")
             text = ""
             for selector in (
                 ".progress-label",
@@ -902,8 +982,10 @@ class PlaywrightStudio:
                 if any(
                     marker in lowered
                     for marker in (
-                        "processing", "checks", "complete", "finished", "uploaded",
-                        "оброб", "перевір", "заверш", "готово", "上传完成", "处理",
+                        "processing", "checks", "checks complete", "complete",
+                        "finished", "uploaded", "no issues found",
+                        "оброб", "перевір", "заверш", "готово",
+                        "порушень не виявлено", "上传完成", "处理",
                     )
                 ):
                     self.log(f"завантаження завершено: {text[:60]}")
@@ -931,123 +1013,215 @@ class PlaywrightStudio:
                 raise BrowserError(f"не знайдено перемикач приватності «{plan.privacy}»")
 
     def _click_done(self) -> None:
+        self._ensure_open("натискання кнопки публікації")
         button = self._dialog().locator("#done-button").first
         button.wait_for(state="visible", timeout=30_000)
         deadline = time.monotonic() + 60
         while button.is_disabled() and time.monotonic() < deadline:
+            self._ensure_open("очікування кнопки публікації")
             time.sleep(0.5)
         button.click()
-        self.log("натиснуто «Опублікувати», чекаю обробку…")
+        self.log("натиснуто фінальну кнопку, чекаю збереження…")
 
     # --- результат --------------------------------------------------------
-    def _wait_video_id(self, plan: PublishPlan, timeout: float) -> str | None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.page.is_closed():
-                raise BrowserError("вікно браузера закрито до завершення публікації")
-            found = self._video_id_on_page()
-            if found:
-                return found
-            dialog = self.page.locator("ytcp-uploads-dialog, ytcp-upload-dialog")
-            if dialog.count() == 0:
-                found = self._video_id_from_list(plan.title)
-                if found:
-                    return found
-            time.sleep(2)
-        return self._video_id_from_list(plan.title)
+    def _dialog_visible(self) -> bool:
+        locator = self.page.locator(
+            "ytcp-uploads-dialog tp-yt-paper-dialog:visible, "
+            "ytcp-upload-dialog tp-yt-paper-dialog:visible"
+        )
+        return locator.count() > 0
 
-    def _video_id_on_page(self) -> str | None:
-        found = video_id_from(self.page.url)
-        if found:
-            return found
-        for selector in (
-            'a[href*="youtu.be/"]',
-            'a[href*="watch?v="]',
-        ):
-            links = self.page.locator(selector)
-            for index in range(min(links.count(), 5)):
-                try:
-                    link = links.nth(index)
-                    if not link.is_visible():
-                        continue
-                    found = video_id_from(link.get_attribute("href") or "")
-                    if found:
-                        return found
-                except Exception:  # noqa: BLE001
-                    continue
-        for selector in (
-            "ytcp-uploads-dialog, ytcp-upload-dialog",
-            "tp-yt-paper-dialog",
-        ):
-            dialog = self.page.locator(selector)
-            if not dialog.count():
-                continue
-            try:
-                html = dialog.first.inner_html(timeout=5_000)
-            except Exception:  # noqa: BLE001
-                continue
-            found = video_id_from(html)
-            if found:
-                return found
-        return None
-
-    def _video_id_from_list(self, title: str) -> str | None:
-        """Фолбек: перша сторінка «Вміст» Studio, рядок із такою ж назвою."""
+    def _dialog_success(self) -> bool:
+        if not self._dialog_visible():
+            return False
         try:
-            url = (
-                f"{STUDIO_URL}channel/{self._channel_id}/videos"
-                if self._channel_id
-                else STUDIO_URL
+            text = self._dialog().inner_text().lower()
+        except Exception:  # noqa: BLE001
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "відео опубліковано", "video published",
+                "відео збережено", "video saved",
+                "опубліковано як приватне", "published as private",
             )
-            self.page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-            self.page.wait_for_selector("ytcp-video-row", timeout=60_000)
-            rows = self.page.locator("ytcp-video-row")
-            needle = title.strip().lower()[:40]
-            for index in range(min(rows.count(), 15)):
-                row = rows.nth(index)
-                try:
-                    text = row.inner_text().lower()
-                except Exception:  # noqa: BLE001
-                    continue
-                if needle and needle not in text:
-                    continue
-                link = row.locator('a[href*="/video/"]').first
-                href = link.get_attribute("href") if link.count() else None
-                found = video_id_from(href or "")
-                if found:
-                    return found
-        except Exception as exc:  # noqa: BLE001
-            self.log(f"! не вдалося знайти відео у списку Studio: {exc}")
+        )
+
+    def _wait_video_id(
+        self, plan: PublishPlan, timeout: float, *, require_close: bool = False
+    ) -> str | None:
+        """Чекає підтвердження публікації й шукає id у списку відео каналу.
+
+        Посилання в діалозі до натискання «Опублікувати» — це ще неопублікована
+        чернетка, тому довіряємо лише рядку в «Вміст» Studio (spec 016, R11).
+        """
+        deadline = time.monotonic() + timeout
+        wait_limit = deadline if require_close else min(deadline, time.monotonic() + 30.0)
+        while time.monotonic() < wait_limit:
+            self._ensure_open("очікування завершення публікації")
+            if self._dialog_success() or not self._dialog_visible():
+                break
+            time.sleep(2 if require_close else 1)
+
+        remaining = max(60.0, deadline - time.monotonic())
+        return self._video_id_from_list(plan.title, timeout=min(remaining, 240.0))
+
+    def _video_id_from_list(self, title: str, timeout: float = 120.0) -> str | None:
+        """Шукає відео за назвою у списку «Вміст» Studio, доки воно не з'явиться."""
+        url = (
+            f"{STUDIO_URL}channel/{self._channel_id}/videos"
+            if self._channel_id
+            else STUDIO_URL
+        )
+        needle = " ".join(title.strip().lower().split())[:40]
+        deadline = time.monotonic() + timeout
+        last_error = ""
+        while time.monotonic() < deadline:
+            self._ensure_open("пошуку відео у списку Studio")
+            try:
+                self.page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+                self.page.wait_for_selector("ytcp-video-row", timeout=30_000)
+                rows = self.page.locator("ytcp-video-row")
+                for index in range(min(rows.count(), 20)):
+                    row = rows.nth(index)
+                    try:
+                        text = " ".join(row.inner_text().lower().split())
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if needle and needle not in text:
+                        continue
+                    link = row.locator('a[href*="/video/"]').first
+                    href = link.get_attribute("href") if link.count() else None
+                    found = video_id_from(href or "")
+                    if found:
+                        self.log(f"знайдено відео у «Вміст»: {found}")
+                        return found
+            except BrowserError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+            time.sleep(5)
+        if last_error:
+            self.log(f"! не вдалося знайти відео у списку Studio: {last_error}")
         return None
 
     # --- обкладинка -------------------------------------------------------
+    def _upload_thumbnail_in_scope(self, path: Path, *, scope) -> bool:
+        """Завантажує обкладинку в межах діалогу створення чи сторінки редагування (BROW-AC15).
+
+        `ytcp-thumbnail-uploader input#file-loader` має `hidden`/`display: none` (0x0),
+        тому чекаємо `visible` на контейнері та `attached` на самому `input[type=file]`.
+        """
+        self._ensure_open("додавання обкладинки")
+        box = scope.locator("ytcp-thumbnail-uploader").first
+        box.wait_for(state="visible", timeout=20_000)
+        field = scope.locator(
+            'ytcp-thumbnail-uploader input[type="file"], '
+            'input[type="file"][accept*="image"]'
+        ).first
+        field.wait_for(state="attached", timeout=10_000)
+        field.set_input_files(str(path))
+
+        preview = scope.locator(
+            "ytcp-thumbnail-uploader #options-button, "
+            "ytcp-thumbnail-uploader #preview-button, "
+            'ytcp-thumbnail-uploader img#img-with-fallback[src^="data:"], '
+            'ytcp-thumbnail-uploader img#img-with-fallback[src^="blob:"]'
+        ).first
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            self._ensure_open("перевірки завантаженої обкладинки")
+            try:
+                if preview.count() and preview.is_visible():
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            if self._confirm_thumbnail_crop(timeout=0.4):
+                return True
+            time.sleep(0.3)
+        return True
+
     def _set_thumbnail(self, video_id: str, path: Path, warnings: list[str]) -> bool:
+        """Ставить обкладинку на сторінці редагування й зберігає сторінку (BROW-R2)."""
         try:
+            self._ensure_open("переходу на сторінку обкладинки")
             self.page.goto(
                 f"{STUDIO_URL}video/{video_id}/edit",
                 wait_until="domcontentloaded",
                 timeout=90_000,
             )
-            self._wait_visible(
-                'ytcp-thumbnail-uploader input[type="file"], input[type="file"][accept*="image"]',
-                timeout=60,
-            )
-            field = self.page.locator(
-                '#file-loader input[type="file"], '
-                'ytcp-thumbnail-uploader input[type="file"], '
-                'input[type="file"][accept*="image"]'
-            ).first
-            field.set_input_files(str(path))
-            time.sleep(1.5)
-            # діалог кадрування: «Готово»/«Done»
-            for label in ("Готово", "Done", "Зберегти", "Save"):
-                if self._click_text((label,), scope=self.page, timeout=1.5):
-                    break
+            if not self._upload_thumbnail_in_scope(path, scope=self.page):
+                raise BrowserError("не вдалося завантажити обкладинку")
+            if not self._save_edit_page(allow_disabled=True):
+                warnings.append(
+                    "обкладинку завантажено, але кнопка «Зберегти» не підтвердила зміну"
+                )
+                return False
             self.log("обкладинку встановлено")
             return True
         except Exception as exc:  # noqa: BLE001 — best-effort
             warnings.append(f"обкладинку не встановлено: {exc}")
             return False
+
+    def _confirm_thumbnail_crop(self, timeout: float = 3.0) -> bool:
+        """Підтверджує кадрування обкладинки, якщо Studio його показала."""
+        deadline = time.monotonic() + timeout
+        selectors = (
+            "ytcp-thumbnail-crop-dialog",
+            "ytcp-image-cropper",
+            "ytcp-thumbnail-editor",
+        )
+        while True:
+            self._ensure_open("кадрування обкладинки")
+            for scope_selector in selectors:
+                scope = self.page.locator(scope_selector).last
+                try:
+                    if not scope.count() or not scope.is_visible():
+                        continue
+                except Exception:  # noqa: BLE001
+                    continue
+                for label in ("Готово", "Done", "Застосувати", "Apply"):
+                    try:
+                        button = scope.get_by_role("button", name=label, exact=False)
+                        if button.count() and button.first.is_visible():
+                            button.first.click()
+                            time.sleep(0.8)
+                            return True
+                    except Exception:  # noqa: BLE001
+                        continue
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.3)
+
+    def _save_edit_page(self, *, allow_disabled: bool = False) -> bool:
+        """Тисне «Зберегти» на сторінці редагування, якщо кнопка стала активною."""
+        deadline = time.monotonic() + (6.0 if allow_disabled else 30.0)
+        save = self.page.locator("ytcp-button#save, #save").first
+        while time.monotonic() < deadline:
+            self._ensure_open("збереження обкладинки")
+            try:
+                if save.count() and save.is_visible() and not save.is_disabled():
+                    save.click()
+                    # після збереження кнопка знову неактивна
+                    for _ in range(30):
+                        self._ensure_open("підтвердження збереження")
+                        time.sleep(0.5)
+                        try:
+                            if save.is_disabled():
+                                return True
+                        except Exception:  # noqa: BLE001
+                            return True
+                    return False
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.4)
+        if allow_disabled:
+            try:
+                if save.count() and save.is_disabled():
+                    return True  # Studio вже зберегла зміну сама
+            except Exception:  # noqa: BLE001
+                pass
+        return False
 
     # --- субтитри ---------------------------------------------------------
     def _set_captions(self, video_id: str, srt: Path, warnings: list[str]) -> bool:
@@ -1140,6 +1314,7 @@ class BrowserPublisher:
         self.log = log or pipe.log
         self._driver = driver
         self._session: ChromeSession | None = None
+        self._dry_run = False
 
     def _get_driver(self) -> StudioDriver:
         if self._driver is None:
@@ -1161,11 +1336,13 @@ class BrowserPublisher:
         if STATUS_ORDER.get(job.status, 0) < STATUS_ORDER["rendered"]:
             self.log(f"[{job.id}] спершу відрендеріть відео")
             return job
+        self._dry_run = dry_run
         if dry_run and job.video_id:
             self.log(f"[{job.id}] dry-run: відео вже на YouTube ({job.url}); нічого не змінюю")
+            job.error = None
             return job
         if job.status == "uploaded" and not job.video_id:
-            return self.pipe._fail(
+            return self._fail(
                 job,
                 "відео, ймовірно, вже опубліковано, але video_id не збережено. "
                 "Перевірте YouTube Studio; щоб повторити публікацію, скиньте задачу: "
@@ -1175,7 +1352,7 @@ class BrowserPublisher:
         try:
             meta = load_meta(job.audio)
         except Exception as exc:  # noqa: BLE001
-            return self.pipe._fail(job, f"метадані: {exc}")
+            return self._fail(job, f"метадані: {exc}")
 
         # dry-run не має права навіть створювати .srt з транскрипту
         subtitles = None
@@ -1184,12 +1361,23 @@ class BrowserPublisher:
             if subtitles and (not subtitles.exists() or subtitles.suffix != ".srt"):
                 subtitles = None
         thumbnail = job.thumbnail if job.thumbnail and job.thumbnail.exists() else None
+        if thumbnail is None:
+            candidate = self.cfg.output / f"{job.slug}.jpg"
+            if candidate.exists():
+                thumbnail = candidate
 
         if not job.video_id:
             if not job.video or not job.video.exists():
-                return self.pipe._fail(job, f"файл відео не знайдено: {job.video}")
+                return self._fail(job, f"файл відео не знайдено: {job.video}")
             if dry_run:
-                self.log(f"[{job.id}] dry-run: відкрию Studio і заповню форму «{meta.title}»")
+                privacy = meta.privacy or self.cfg.youtube.default_privacy
+                self.log(
+                    f"[{job.id}] dry-run: перевірю доступ до Studio; "
+                    f"«{meta.youtube_title()}», приватність {privacy}, "
+                    f"теги: {len(meta.youtube_tags(self.cfg.description.default_tags))}, "
+                    f"обкладинка: {'є' if thumbnail else 'немає'}, "
+                    f"субтитри: {'є' if job.subtitles and job.subtitles.exists() else 'немає'}"
+                )
 
         try:
             driver = self._get_driver()
@@ -1204,7 +1392,7 @@ class BrowserPublisher:
                 return self.pipe.db.update(job.id, status="done", error=None)
 
             if not job.video:
-                return self.pipe._fail(job, "немає шляху до відеофайлу")
+                return self._fail(job, "немає шляху до відеофайлу")
             self.log(f"[{job.id}] завантажую через браузер: «{meta.title}»")
             out = driver.publish(
                 job.video,
@@ -1217,6 +1405,7 @@ class BrowserPublisher:
             self._log_warnings(job, out)
             if dry_run:
                 self.log(f"[{job.id}] dry-run завершено, БД не змінено")
+                job.error = None
                 return job
             if not out.video_id:
                 return self.pipe.db.update(
@@ -1235,7 +1424,14 @@ class BrowserPublisher:
                 job.id, status="uploaded", error=str(exc)
             )
         except Exception as exc:  # noqa: BLE001 — одна задача не має валити решту
-            return self.pipe._fail(job, f"браузер: {exc}")
+            return self._fail(job, f"браузер: {exc}")
+
+    def _fail(self, job: "Job", message: str) -> "Job":
+        if self._dry_run:
+            self.log(f"[{job.id}] ПОМИЛКА {message} (dry-run: БД не змінено)")
+            job.error = message
+            return job
+        return self.pipe._fail(job, message)
 
     def _log_warnings(self, job: "Job", out: PublishOutcome) -> None:
         for warning in out.warnings:

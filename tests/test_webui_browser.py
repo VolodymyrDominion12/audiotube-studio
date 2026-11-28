@@ -73,6 +73,13 @@ class BrowserWebUITests(unittest.TestCase):
         self.assertIn('id="browser-review"', html)
         self.assertIn("/api/browser", html)
 
+    def test_index_resumes_browser_poll_on_load(self):
+        """BROW-AC16: після перезавантаження сторінки веб-UI підхоплює активний браузерний прогін."""
+        status, body = self.request("/")
+        html = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("maybeResumeBrowser", html)
+
     def test_start_and_busy(self):
         """BROW-AC12: фоновий запуск, повторний — 409, стан доступний через /api/browser."""
         started = threading.Event()

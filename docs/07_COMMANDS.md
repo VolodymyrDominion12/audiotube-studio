@@ -108,8 +108,8 @@ audiotube subtitles --dry-run       # що зміниться в SRT, нічог
 ```bash
 audiotube browser-auth                    # один раз: звичайне вікно Chrome, вхід і закрити вікно
 audiotube browser-upload                  # усі rendered/uploaded; типово private
-audiotube browser-upload 185 --review     # заповнити все, фінальний клік — людина
-audiotube browser-upload 185 --dry-run    # заповнити форму, не публікувати, БД не змінювати
+audiotube browser-upload 185 --review     # заповнити все; клік і закриття діалогу — людина
+audiotube browser-upload 185 --dry-run    # перевірити доступ і план, без завантаження файлу
 audiotube browser-upload 185 --keep-open  # лишити вікно відкритим
 ```
 

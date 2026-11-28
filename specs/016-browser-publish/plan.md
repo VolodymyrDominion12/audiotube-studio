@@ -16,6 +16,17 @@
 Альтернативу `launch_persistent_context()` відкинули: Playwright додає свої прапорці запуску,
 і Google частіше блокує вхід.
 
+Підводні камені, знайдені на живому Studio:
+
+- `ytcp-uploads-dialog` — нульової висоти; видимий елемент — вкладений `tp-yt-paper-dialog`.
+- `ytcp-thumbnail-uploader input[type=file]` (`#file-loader`) має `hidden`/`display: none` (`0×0`),
+  тому очікувати `state="visible"` не можна — чекаємо `visible` для `ytcp-thumbnail-uploader`
+  і `attached` для `input[type=file]`; ставимо обкладинку одразу на кроці «Деталі» при створенні відео.
+- Playwright через CDP відмовляється передавати файли >50 МБ («not co-located»), тому шлях
+  ставимо через `DOM.setFileInputFiles` (Chrome локальний і сам читає файл).
+- Посилання в діалозі до натискання «Опублікувати» — це ще чернетка; `video_id` беремо
+  з рядка «Вміст» Studio після збереження.
+
 UI-кроки інкапсульовані в `PlaywrightStudio` (реалізація протоколу `StudioDriver`).
 `BrowserPublisher` працює лише з протоколом, тому тести не потребують браузера.
 

@@ -9,3 +9,5 @@
 - [x] **T5** CLI `browser-auth`, `browser-upload` — AC: BROW-AC13 — тест: `test_cli_browser_upload`
 - [x] **T6** [P] Веб-UI: кнопка, API, фоновий потік — AC: BROW-AC12 — тест: `test_webui_browser.py::test_start_and_busy`
 - [x] **T7** Docs: README, `docs/07_COMMANDS.md`, `config.example.yaml`, реєстр `specs/README.md`, статус → implemented
+- [x] **T8** Обкладинка під час створення відео (`_fill_details`) і коректне очікування прихованого `input[type=file]` (`attached`, не `visible`) + fallback на `/edit` — AC: BROW-AC15 — тест: `test_browser_publish.py::test_thumbnail_uploaded_during_video_creation`
+- [x] **T9** Захист від зависань очікувань при закритті сторінки/діалогу, таймаут скриншота, підхоплення `/api/browser` у веб-UI — AC: BROW-AC16 — тести: `test_browser_publish.py::test_closed_page_aborts_wait_loops`, `test_webui_browser.py::test_index_resumes_browser_poll_on_load`

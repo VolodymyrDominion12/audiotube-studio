@@ -1674,6 +1674,15 @@ function pollBrowser() {
     }
   }, 2000);
 }
+async function maybeResumeBrowser() {
+  try {
+    const s = await api("/api/browser");
+    if (s.status === "running") {
+      setLog(s.log && s.log.length ? s.log : [s.message || "працюю…"]);
+      pollBrowser();
+    }
+  } catch {}
+}
 async function editMeta(id) {
   try {
     const data = await api(`/api/jobs/${id}/meta`);
@@ -1828,6 +1837,7 @@ async function init() {
   await Promise.all([loadOverview(), loadGroups()]);
   if (overview.sync) activeRun = overview.sync;
   maybeResumeSync();
+  maybeResumeBrowser();
 }
 init();
 setInterval(loadOverview, 15000);

@@ -17,6 +17,7 @@ from unittest import mock
 from audiotube.browser_publish import (
     AUTH_HINT,
     BrowserAuthError,
+    BrowserError,
     BrowserPublisher,
     ChromeSession,
     PlaywrightStudio,
@@ -217,9 +218,10 @@ class BrowserPublisherTests(BrowserTestBase):
         self.assertEqual(pipe.db.uploads_count(), 0)
 
     def test_dry_run_keeps_db_untouched(self):
-        """BROW-AC4: dry-run заповнює форму, але не публікує й не змінює БД."""
+        """BROW-AC4: dry-run не публікує, не змінює БД і не показує стару помилку."""
         root = self.make_root()
         pipe, job_id = self.make_job(root)
+        pipe.db.update(job_id, error="стара помилка")
         fake = FakeDriver()
         pub = BrowserPublisher(pipe, driver=fake, log=lambda *_: None)
 
@@ -227,9 +229,24 @@ class BrowserPublisherTests(BrowserTestBase):
 
         self.assertEqual(result.status, "rendered")
         self.assertIsNone(result.video_id)
+        self.assertIsNone(result.error, "успішний dry-run не має повертати стару помилку")
+        self.assertEqual(pipe.db.get(job_id).error, "стара помилка", "dry-run не пише в БД")
         self.assertEqual(pipe.db.uploads_count(), 0)
         call = [c for c in fake.calls if c["op"] == "publish"][0]
         self.assertTrue(call["dry_run"])
+
+    def test_dry_run_failure_does_not_write_db(self):
+        """BROW-AC4: невдача dry-run не змінює БД, лише повертає помилку."""
+        root = self.make_root()
+        pipe, job_id = self.make_job(root)
+        fake = FakeDriver(fail=BrowserError("немає доступу до Studio"))
+        pub = BrowserPublisher(pipe, driver=fake, log=lambda *_: None)
+
+        result = pub.publish(pipe.db.get(job_id), dry_run=True)
+
+        self.assertIn("немає доступу", result.error or "")
+        self.assertEqual(pipe.db.get(job_id).status, "rendered")
+        self.assertIsNone(pipe.db.get(job_id).error)
 
     def test_dry_run_uploaded_job_keeps_status(self):
         """BROW-AC4: dry-run для вже завантаженого відео не чіпає ні YouTube, ні БД."""
@@ -400,6 +417,275 @@ class BrowserPlanTests(BrowserTestBase):
 
         self.assertEqual(name, "Канал")
         self.assertNotIn(("wait", cfg.youtube.browser.login_timeout), session.visited)
+
+    def test_thumbnail_uploaded_during_video_creation(self):
+        """BROW-AC15: обкладинка завантажується на кроці деталей під час створення відео."""
+        root = self.make_root()
+        cfg = load_config(root=root)
+        cfg.ensure_dirs()
+        video = cfg.output / "tema.mp4"
+        video.write_bytes(b"video")
+        thumb = cfg.output / "tema.jpg"
+        thumb.write_bytes(b"jpg")
+        meta = VideoMeta(title="Назва", description="Опис")
+
+        events: list[str] = []
+
+        class RecordingStudio(PlaywrightStudio):
+            def _open_upload_dialog(self):
+                events.append("open")
+
+            def _select_file(self, v):
+                events.append("select_file")
+
+            def _wait_details(self):
+                events.append("wait_details")
+
+            def _fill_details(self, plan):
+                events.append("fill_details")
+                return super()._fill_details(plan)
+
+            def _fill_editable(self, locator, text):
+                pass
+
+            def _set_made_for_kids(self, made_for_kids):
+                pass
+
+            def _show_more(self):
+                pass
+
+            def _fill_tags(self, tags):
+                pass
+
+            def _set_synthetic_disclosure(self):
+                pass
+
+            def _upload_thumbnail_in_scope(self, path, *, scope):
+                events.append(f"dialog_thumb:{path.name}")
+                return True
+
+            def _advance_to_visibility(self, privacy):
+                events.append("advance")
+
+            def _select_visibility(self, plan):
+                events.append("visibility")
+
+            def _wait_upload_complete(self, timeout=None):
+                events.append("wait_upload")
+                return True
+
+            def _click_done(self):
+                events.append("done")
+
+            def _wait_video_id(self, plan, timeout, *, require_close=False):
+                events.append("wait_id")
+                return VIDEO_ID
+
+            def _set_thumbnail(self, video_id, path, warnings):
+                events.append("edit_thumb")
+                return True
+
+        class DummyLocator:
+            def __init__(self):
+                self.first = self
+
+            def count(self):
+                return 1
+
+            def wait_for(self, **kwargs):
+                pass
+
+        class DummyPage:
+            def locator(self, _sel):
+                return DummyLocator()
+
+            def is_closed(self):
+                return False
+
+        session = FakeSession(logged_in=True)
+        session.page = DummyPage()
+        studio = RecordingStudio(session, cfg, log=lambda *_: None)
+
+        out = studio.publish(
+            video, meta, thumbnail=thumb, captions=None, review=False, dry_run=False
+        )
+
+        self.assertTrue(out.published)
+        self.assertTrue(out.thumbnail)
+        self.assertIn("dialog_thumb:tema.jpg", events)
+        self.assertLess(events.index("dialog_thumb:tema.jpg"), events.index("advance"))
+        self.assertNotIn("edit_thumb", events, "не дублювати завантаження обкладинки на /edit")
+
+    def test_thumbnail_falls_back_to_edit_if_dialog_upload_fails(self):
+        """BROW-AC15: якщо в діалозі обкладинку не вдалося поставити, _finish_assets ставить її на /edit."""
+        root = self.make_root()
+        cfg = load_config(root=root)
+        cfg.ensure_dirs()
+        video = cfg.output / "tema.mp4"
+        video.write_bytes(b"video")
+        thumb = cfg.output / "tema.jpg"
+        thumb.write_bytes(b"jpg")
+        meta = VideoMeta(title="Назва")
+
+        events: list[str] = []
+
+        class FallbackStudio(PlaywrightStudio):
+            def _open_upload_dialog(self): pass
+            def _select_file(self, v): pass
+            def _wait_details(self): pass
+            def _fill_editable(self, locator, text): pass
+            def _set_made_for_kids(self, made_for_kids): pass
+            def _show_more(self): pass
+            def _fill_tags(self, tags): pass
+            def _set_synthetic_disclosure(self): pass
+            def _advance_to_visibility(self, privacy): pass
+            def _select_visibility(self, plan): pass
+            def _wait_upload_complete(self, timeout=None): return True
+            def _click_done(self): pass
+            def _wait_video_id(self, plan, timeout, *, require_close=False): return VIDEO_ID
+
+            def _upload_thumbnail_in_scope(self, path, *, scope):
+                events.append("dialog_thumb_fail")
+                return False
+
+            def _set_thumbnail(self, video_id, path, warnings):
+                events.append("edit_thumb")
+                return True
+
+        class DummyLocator:
+            def __init__(self):
+                self.first = self
+
+            def count(self):
+                return 1
+
+            def wait_for(self, **kwargs):
+                pass
+
+        class DummyPage:
+            def locator(self, _sel):
+                return DummyLocator()
+
+            def is_closed(self):
+                return False
+
+        session = FakeSession(logged_in=True)
+        session.page = DummyPage()
+        studio = FallbackStudio(session, cfg, log=lambda *_: None)
+
+        out = studio.publish(
+            video, meta, thumbnail=thumb, captions=None, review=False, dry_run=False
+        )
+
+        self.assertTrue(out.thumbnail)
+        self.assertEqual(events, ["dialog_thumb_fail", "edit_thumb"])
+
+    def test_thumbnail_upload_waits_for_attached_not_visible(self):
+        """BROW-AC15: прихований input[type=file] очікується як attached, а не visible."""
+        root = self.make_root()
+        cfg = load_config(root=root)
+        cfg.ensure_dirs()
+        thumb = cfg.output / "tema.jpg"
+        thumb.write_bytes(b"jpg")
+
+        uploaded_files: list[str] = []
+
+        class UploaderBox:
+            def __init__(self):
+                self.first = self
+
+            def wait_for(self, *, state="visible", timeout=0):
+                if state != "visible":
+                    raise AssertionError(f"unexpected uploader state={state}")
+
+        class HiddenFileInput:
+            def __init__(self):
+                self.first = self
+
+            def wait_for(self, *, state="visible", timeout=0):
+                if state == "visible":
+                    raise TimeoutError("input[type=file] is hidden")
+
+            def set_input_files(self, path):
+                uploaded_files.append(path)
+
+        class FakePreview:
+            def __init__(self):
+                self.first = self
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+        class FakeScope:
+            def locator(self, selector):
+                if selector == "ytcp-thumbnail-uploader":
+                    return UploaderBox()
+                if "input" in selector:
+                    return HiddenFileInput()
+                return FakePreview()
+
+        session = FakeSession(logged_in=True)
+        session.page = FakeScope()
+        studio = PlaywrightStudio(session, cfg, log=lambda *_: None)
+
+        ok = studio._upload_thumbnail_in_scope(thumb, scope=FakeScope())
+
+        self.assertTrue(ok)
+        self.assertEqual(uploaded_files, [str(thumb)])
+
+    def test_browser_publisher_finds_output_thumbnail_fallback(self):
+        """BROW-AC15: якщо job.thumbnail не записано в БД, береться output/<slug>.jpg."""
+        root = self.make_root()
+        pipe, job_id = self.make_job(root)
+        pipe.db.update(job_id, thumbnail=None)
+        fallback = pipe.cfg.output / "tema.jpg"
+        fallback.write_bytes(b"jpg")
+        fake = FakeDriver()
+        pub = BrowserPublisher(pipe, driver=fake, log=lambda *_: None)
+
+        pub.publish(pipe.db.get(job_id))
+
+        call = [c for c in fake.calls if c["op"] == "publish"][0]
+        self.assertEqual(call["thumbnail"], fallback)
+
+    def test_closed_page_aborts_wait_loops(self):
+        """BROW-AC16: закрите вікно негайно перериває очікування без зависання."""
+        root = self.make_root()
+        cfg = load_config(root=root)
+
+        class ClosedLocator:
+            def __init__(self):
+                self.first = self
+
+            def wait_for(self, **kwargs):
+                pass
+
+            def is_disabled(self):
+                return True
+
+            def count(self):
+                return 0
+
+        class ClosedPage:
+            def is_closed(self):
+                return True
+
+            def locator(self, _sel):
+                return ClosedLocator()
+
+        session = FakeSession(logged_in=True)
+        session.page = ClosedPage()
+        studio = PlaywrightStudio(session, cfg, log=lambda *_: None)
+
+        with self.assertRaises(BrowserError):
+            studio._wait_upload_complete(timeout=60)
+        with self.assertRaises(BrowserError):
+            studio._next()
+        with self.assertRaises(BrowserError):
+            studio._click_done()
 
 
 if __name__ == "__main__":

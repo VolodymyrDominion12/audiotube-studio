@@ -266,8 +266,8 @@ new → transcribed → described → rendered → uploaded → done
 ```bash
 audiotube browser-auth                       # один раз: вхід у звичайному вікні Chrome
 audiotube browser-upload                     # усі відрендерені; типово private
-audiotube browser-upload 185 --review        # заповнити все, «Опублікувати» натискає людина
-audiotube browser-upload 185 --dry-run       # заповнити форму й закрити, без публікації
+audiotube browser-upload 185 --review        # заповнити все; публікуєте й закриваєте діалог ви
+audiotube browser-upload 185 --dry-run       # перевірити доступ і план, без завантаження
 audiotube browser-upload 185 --keep-open     # не закривати вікно після роботи
 ```
 
